@@ -1,9 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
   assertSettingsSignature,
-  InvalidSignatureFrequencyError,
+  InvalidSignatureChoiceError,
   InvalidSignatureSwitchError,
 } from "@/modules/agents/service";
+import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
+import {
+  SIGNATURE_CHOICES,
+  SIGNATURE_FREQUENCIES,
+  SIGNATURE_POSITIONS,
+  SIGNATURE_SEPARATORS,
+} from "@/modules/signature/domains";
+import { readSignatureConfig } from "@/modules/signature/service";
 
 // THE SWITCH IS REFUSED AT THE WRITE, not normalised in the reader (#612).
 //
@@ -103,8 +111,8 @@ describe("assertSettingsSignature: the frequency", () => {
     } catch (e) {
       caught = e;
     }
-    expect(caught).toBeInstanceOf(InvalidSignatureFrequencyError);
-    const err = caught as InvalidSignatureFrequencyError & {
+    expect(caught).toBeInstanceOf(InvalidSignatureChoiceError);
+    const err = caught as InvalidSignatureChoiceError & {
       field?: string;
       statusCode?: number;
     };
@@ -117,7 +125,7 @@ describe("assertSettingsSignature: the frequency", () => {
     for (const bad of [1, null, {}, true]) {
       expect(() =>
         assertSettingsSignature({ signature: { frequency: bad } }, undefined),
-      ).toThrow(InvalidSignatureFrequencyError);
+      ).toThrow(InvalidSignatureChoiceError);
     }
   });
 
@@ -139,7 +147,7 @@ describe("assertSettingsSignature: the frequency", () => {
         { signature: { frequency: "toda" } },
         { signature: { frequency: "sempre" } },
       ),
-    ).toThrow(InvalidSignatureFrequencyError);
+    ).toThrow(InvalidSignatureChoiceError);
   });
 
   // The two guards are independent: a bad switch alongside a good frequency still throws the
@@ -156,6 +164,193 @@ describe("assertSettingsSignature: the frequency", () => {
         { signature: { enabled: true, frequency: "sempre" } },
         undefined,
       ),
-    ).toThrow(InvalidSignatureFrequencyError);
+    ).toThrow(InvalidSignatureChoiceError);
+  });
+});
+
+// THE TWO OLDER ENUMS, which #616 left un-guarded on purpose and filed as #618. Same hole as the
+// frequency: the reader normalises `"esquerda"` to `"top"`, the runtime signs at the top, and GET
+// echoes `"esquerda"`. Asked without naming an error class, so on the base (where nothing throws)
+// these fail on the assertion rather than on an import.
+describe("assertSettingsSignature: position and separator", () => {
+  const refusal = (settings: unknown, stored: unknown) => {
+    try {
+      assertSettingsSignature(settings, stored);
+    } catch (e) {
+      return e as { field?: string; statusCode?: number; message: string };
+    }
+    return null;
+  };
+
+  test("every value the reader keeps passes", () => {
+    for (const position of ["top", "bottom"]) {
+      expect(refusal({ signature: { position } }, undefined)).toBeNull();
+    }
+    for (const separator of ["blank", "--"]) {
+      expect(refusal({ signature: { separator } }, undefined)).toBeNull();
+    }
+  });
+
+  test("an absent field passes: the reader answers it with the default", () => {
+    expect(refusal({ signature: { text: "Alex" } }, undefined)).toBeNull();
+  });
+
+  test("a position outside the domain is refused, naming the field", () => {
+    const err = refusal({ signature: { position: "esquerda" } }, undefined);
+    expect(err?.statusCode).toBe(400);
+    expect(err?.field).toBe("signature.position");
+    expect(err?.message).toContain('"esquerda"');
+  });
+
+  test("a separator outside the domain is refused, naming the field", () => {
+    const err = refusal({ signature: { separator: "~~" } }, undefined);
+    expect(err?.statusCode).toBe(400);
+    expect(err?.field).toBe("signature.separator");
+  });
+
+  test("a value of another type is refused too", () => {
+    for (const bad of [42, null, {}, true, ["top"]]) {
+      expect(refusal({ signature: { position: bad } }, undefined)?.field).toBe(
+        "signature.position",
+      );
+      expect(refusal({ signature: { separator: bad } }, undefined)?.field).toBe(
+        "signature.separator",
+      );
+    }
+  });
+
+  test("a stored bad value re-sent unchanged does not block an unrelated save", () => {
+    const stored = { signature: { position: "esquerda", separator: "~~" } };
+    expect(
+      refusal(
+        { signature: { position: "esquerda", separator: "~~", text: "Outro" } },
+        stored,
+      ),
+    ).toBeNull();
+  });
+
+  // Per FIELD, not per block: fixing the separator of a legacy row does not require fixing its
+  // position in the same save, and changing only one of them names only that one.
+  test("changing one bad value for another is refused, and names only that field", () => {
+    const stored = { signature: { position: "esquerda", separator: "~~" } };
+    const err = refusal(
+      { signature: { position: "direita", separator: "~~" } },
+      stored,
+    );
+    expect(err?.field).toBe("signature.position");
+  });
+
+  test("correcting a stored bad value to a good one passes", () => {
+    expect(
+      refusal(
+        { signature: { position: "bottom", separator: "~~" } },
+        { signature: { position: "esquerda", separator: "~~" } },
+      ),
+    ).toBeNull();
+  });
+});
+
+// THE DOMAIN IS THE READER'S, asked by execution rather than trusted from the constant. The boundary
+// refuses what is not in `SIGNATURE_CHOICES`; that is only right if every value in it is one the
+// reader KEEPS and a value outside it is one the reader REPLACES. A domain that grew on one side
+// only would either refuse a value the runtime honours or accept one it ignores, the hole #618 was.
+describe("the signature's domains are the reader's", () => {
+  test("every allowed value round-trips through readSignatureConfig", () => {
+    for (const [field, allowed] of Object.entries(SIGNATURE_CHOICES)) {
+      for (const value of allowed) {
+        const read = readSignatureConfig({ signature: { [field]: value } });
+        expect({
+          field,
+          value,
+          read: read[field as keyof typeof read],
+        }).toEqual({ field, value, read: value });
+      }
+    }
+  });
+
+  test("a value outside the domain is replaced by the reader, so the boundary must refuse it", () => {
+    for (const field of Object.keys(SIGNATURE_CHOICES)) {
+      const read = readSignatureConfig({ signature: { [field]: "__fora__" } });
+      expect(read[field as keyof typeof read]).not.toBe("__fora__");
+    }
+  });
+
+  test("the table names every closed field of the block and nothing else", () => {
+    expect(Object.keys(SIGNATURE_CHOICES).sort()).toEqual([
+      "frequency",
+      "position",
+      "separator",
+    ]);
+    expect([
+      ...SIGNATURE_POSITIONS,
+      ...SIGNATURE_SEPARATORS,
+      ...SIGNATURE_FREQUENCIES,
+    ]).toHaveLength(6);
+  });
+});
+
+// The three edges the mutation battery found untested, each a way the family's scoping can go wrong.
+describe("assertSettingsSignature: what the stored-value exemption compares", () => {
+  // BY VALUE. A legacy non-primitive arrives through JSON as a new object on every save, so a
+  // reference comparison refuses the very re-send the exemption exists for.
+  test("a stored non-primitive bad value re-sent unchanged saves", () => {
+    expect(() =>
+      assertSettingsSignature(
+        { signature: { position: { lado: "esquerdo" }, text: "Outro" } },
+        { signature: { position: { lado: "esquerdo" }, text: "Alex" } },
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertSettingsSignature(
+        { signature: { enabled: { sim: true }, text: "Outro" } },
+        { signature: { enabled: { sim: true }, text: "Alex" } },
+      ),
+    ).not.toThrow();
+  });
+
+  // ABSENT is not a value. A bag that stops naming the field over a stored bad value leaves it to the
+  // reader's default; refusing would report "got undefined" about a field the caller never sent.
+  test("a bag that omits the field over a stored bad value saves", () => {
+    expect(() =>
+      assertSettingsSignature(
+        { signature: { text: "Alex" } },
+        { signature: { position: "esquerda", separator: "~~" } },
+      ),
+    ).not.toThrow();
+  });
+
+  test("an array is reported as an array, not as an object", () => {
+    let caught: unknown;
+    try {
+      assertSettingsSignature({ signature: { separator: ["--"] } }, undefined);
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as Error).message).toContain("got array");
+  });
+});
+
+// THE MCP SCHEMA ASKS THE SAME DOMAINS. It already refused these on the base; what this pins is that it
+// reads them from `domains.ts` rather than from a fourth copy that could drift.
+describe("the MCP patch schema's signature enums are the domains", () => {
+  const shape = BEHAVIOR_PATCH_SHAPE.signature;
+  test("every allowed value parses and an outside value does not", () => {
+    for (const [field, allowed] of Object.entries(SIGNATURE_CHOICES)) {
+      for (const value of allowed) {
+        expect(shape.safeParse({ [field]: value }).success).toBe(true);
+      }
+      for (const other of Object.values(SIGNATURE_CHOICES).flat()) {
+        if ((allowed as readonly string[]).includes(other)) continue;
+        expect({
+          field,
+          other,
+          ok: shape.safeParse({ [field]: other }).success,
+        }).toEqual({
+          field,
+          other,
+          ok: false,
+        });
+      }
+    }
   });
 });
