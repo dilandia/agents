@@ -10,6 +10,7 @@ import {
   stashMediaAnnotation,
 } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { __resetChatwootVocabCache } from "@/modules/chatwoot/vocab";
 import {
   armObserve,
   observeDedupeKey,
@@ -115,6 +116,22 @@ function stubClient(
       log.publicSends++;
       return {};
     },
+  } as unknown as ChatwootClient;
+}
+
+// THE SAME STUB WITH THE ACCOUNT'S OWN LABEL LIST, which is what the tool puts in its description
+// (`<existing_labels>`); the plain stub above has no `listLabels`, so that read fails there. The trail
+// itself names no title either way (label-writes.ts).
+function stubClientWithVocab(
+  messages: unknown[],
+  labels: string[],
+  log: ClientLog,
+  vocabulary: string[],
+): ChatwootClient {
+  return {
+    ...stubClient(messages, labels, log),
+    listLabels: async () => [...vocabulary],
+    listCustomAttributeDefinitions: async () => [],
   } as unknown as ChatwootClient;
 }
 
@@ -3439,5 +3456,219 @@ describe.skipIf(!dbUp)("the OBSERVE job", () => {
     const lines = await observeLines();
     expect(detailOf(lines, -1).skipped).toBe("agent_no_longer_on_inbox");
     expect(lines.at(-1)?.level).toBe("info");
+  });
+
+  // ISSUE #635. The line used to say `acted: true` and stop, so which label the observation applied,
+  // and which one it replaced, existed only in Chatwoot — which keeps no history of a label write.
+  test("the line records what the observation wrote, naming the operator's own labels", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    const res = await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () =>
+          stubClientWithVocab(
+            [message(1, "quero cancelar")],
+            ["compra-de-ingresso"],
+            log,
+            ["compra-de-ingresso", "cancelamento"],
+          ),
+        makeModel: () =>
+          new LabellingModel(["cancelamento"]) as unknown as BaseChatModel,
+      },
+    );
+    expect(res).toEqual({ outcome: "done" });
+    expect(log.labelsWritten).toEqual([["cancelamento"]]);
+    const detail = detailOf(await observeLines(), -1);
+    expect(detail.acted).toBe(true);
+    expect(detail.labels).toEqual([
+      { scope: "conversation", added: 1, removed: 1, after: 1 },
+    ]);
+  });
+
+  test("a tick that wrote no label leaves the key off the line", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () =>
+          stubClient([message(1, "quero cancelar")], [], log),
+        makeModel: () => new SilentModel() as unknown as BaseChatModel,
+      },
+    );
+    expect(log.labelsWritten).toEqual([]);
+    const detail = detailOf(await observeLines(), -1);
+    expect(detail.labels).toBeUndefined();
+  });
+
+  // REVIEW ROUND 1 of issue #635. A label commits, and then the turn can still fail or be refused —
+  // neither of which is retried, so a line without the write is the write lost for good.
+  test("a write kept by a refusal after it is still on the line", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    const job = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "OBSERVE",
+        dedupeKey: `trail-sup-${process.pid}`,
+        status: "CLAIMED",
+        claimSeq: 6,
+        runAt: new Date(),
+        payload: {
+          instanceId: instanceId.toString(),
+          conversationId: CONV,
+          agentId: agentId.toString(),
+          reason: "burst",
+          atMessageId: null,
+        },
+      },
+    });
+    const res = await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () =>
+          stubClientWithVocab(
+            [message(1, "quero cancelar")],
+            ["compra-de-ingresso"],
+            log,
+            ["compra-de-ingresso", "cancelamento", "duvidas-evento"],
+          ),
+        // ROUND ONE WRITES, round two is refused: the fence is asked at every tool hop, so a
+        // supersession that lands after the first write still stops the turn — and the write stays.
+        makeModel: () => {
+          let n = 0;
+          const rearm = async () => {
+            await suDb.schedulerJob.update({
+              where: { id: job.id },
+              data: { claimSeq: 7 },
+            });
+          };
+          return {
+            bindTools: (_tools: unknown) => ({
+              invoke: async (): Promise<AIMessage> => {
+                n++;
+                if (n === 2) await rearm();
+                return new AIMessage({
+                  content: "",
+                  tool_calls: [
+                    {
+                      name: "set_labels",
+                      args: {
+                        labels: n === 1 ? ["cancelamento"] : ["duvidas-evento"],
+                      },
+                      id: `call_labels_${n}`,
+                    },
+                  ],
+                });
+              },
+            }),
+            invoke: async (): Promise<AIMessage> => new AIMessage(""),
+          } as unknown as BaseChatModel;
+        },
+        claim: { jobId: job.id, claimSeq: 6 },
+      },
+    );
+    expect(res).toEqual({ outcome: "done" });
+    const lines = await observeLines();
+    const last = detailOf(lines, -1);
+    expect(last.skipped).toBe("superseded");
+    expect(last.labels).toEqual([
+      { scope: "conversation", added: 1, removed: 1, after: 1 },
+    ]);
+  });
+
+  test("a write kept by a model failure after it is still on the line", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    // Writes the label on the first round, then blows up on the second.
+    class WritesThenFails {
+      calls = 0;
+      bindTools(_tools: unknown) {
+        const self = this;
+        let n = 0;
+        return {
+          async invoke(): Promise<AIMessage> {
+            self.calls++;
+            n++;
+            if (n === 1) {
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "set_labels",
+                    args: { labels: ["cancelamento"] },
+                    id: "call_labels",
+                  },
+                ],
+              });
+            }
+            throw new Error("provider exploded");
+          },
+        };
+      }
+      async invoke(): Promise<AIMessage> {
+        this.calls++;
+        return new AIMessage("");
+      }
+    }
+    const res = await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () =>
+          stubClientWithVocab(
+            [message(1, "quero cancelar")],
+            ["compra-de-ingresso"],
+            log,
+            ["compra-de-ingresso", "cancelamento"],
+          ),
+        makeModel: () => new WritesThenFails() as unknown as BaseChatModel,
+      },
+    );
+    // Done, not retried: a tool already committed.
+    expect(res).toEqual({ outcome: "done" });
+    expect(log.labelsWritten).toEqual([["cancelamento"]]);
+    const last = detailOf(await observeLines(), -1);
+    expect(last.failed).toBe("model_call");
+    expect(last.retried).toBe(false);
+    expect(last.labels).toEqual([
+      { scope: "conversation", added: 1, removed: 1, after: 1 },
+    ]);
   });
 });
