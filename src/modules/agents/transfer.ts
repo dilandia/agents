@@ -114,6 +114,7 @@ import {
   AGENT_SELECT,
   type AgentDto,
   assertPromptSize,
+  dropUnusableImportedSettingsInPlace,
   requireTenant,
   toDto,
 } from "./service";
@@ -1079,6 +1080,9 @@ class DryRunRollback extends Error {
   }
 }
 
+// How many unusable settings values an import names one by one before it just counts the rest.
+const SETTINGS_DROPPED_NAMED = 20;
+
 export async function importAgent(
   ctx: TenantContext,
   raw: unknown,
@@ -1369,21 +1373,45 @@ export async function importAgent(
         params: { count: prompt.renamed, name: "set_labels" },
       });
     }
+    // Copied before the pass below edits it in place: the bag above is still read after the row is
+    // written (`carriesRetiredTaxonomy`), and the blocks the passes above did not rebuild are shared.
+    const storable = structuredClone(
+      disarmFullDetail(
+        stripRetiredLabelKeys(
+          renameNativeToolKeys(
+            normalizeSettingsForStorage(settings) ?? settings,
+            renamed,
+            customToolNames,
+          ),
+        ),
+      ),
+    );
+    // What create would refuse, normalized and named (#631): a closed value outside its domain, half a
+    // fallback, a tool guard that cannot parse. Asked of the bag AS IT WILL BE STORED, after the
+    // renames and strips above, so a note under a pre-rename native name is judged under the name the
+    // schema checks rather than passing as an unknown key.
+    // Named one by one up to a point, and counted past it: a bundle can carry thousands of unusable
+    // entries in one list, and a warning apiece would be the whole response.
+    const unusable = dropUnusableImportedSettingsInPlace(storable);
+    let named = 0;
+    for (const field of unusable.paths) {
+      if (named >= SETTINGS_DROPPED_NAMED) break;
+      warnings.push({ code: "settingsValueDropped", params: { field } });
+      named += 1;
+    }
+    if (unusable.count > named) {
+      warnings.push({
+        code: "settingsValuesDroppedMore",
+        params: { count: unusable.count - named },
+      });
+    }
     const created = await db.agent.create({
       data: {
         tenantId,
         name: exp.name,
         systemPrompt: prompt.text,
         modelConfig: modelConfig as Prisma.InputJsonValue,
-        settings: disarmFullDetail(
-          stripRetiredLabelKeys(
-            renameNativeToolKeys(
-              normalizeSettingsForStorage(settings) ?? settings,
-              renamed,
-              customToolNames,
-            ),
-          ),
-        ) as Prisma.InputJsonValue,
+        settings: storable as Prisma.InputJsonValue,
         transferWithSummary: exp.transferWithSummary,
         businessHoursId,
         followUpHoursId,
