@@ -30,11 +30,13 @@ import { isMonitoring } from "@/modules/agents/mode";
 import { agentObservesNow } from "@/modules/agents/speaks";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { resetAckSendId } from "@/modules/chatwoot/constants";
 import {
   type LoadChatwootClientDeps,
   loadAgentBot,
   loadChatwootClient,
 } from "@/modules/chatwoot/instance";
+import { labelsNarrated } from "@/modules/chatwoot/label-activity";
 import {
   buildQuoteResolver,
   type ChatwootMessageRow,
@@ -45,6 +47,7 @@ import {
   renderAttendantMessage,
   renderInboundMessage,
 } from "@/modules/chatwoot/render";
+import { loadChatwootLabels } from "@/modules/chatwoot/vocab";
 import { underSignal } from "@/modules/contact-auth/check";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import {
@@ -129,13 +132,23 @@ const NOTES_MAX_CHARS = 8_000;
 // ...and no single note may eat the whole budget, so one operator who pasted a log cannot hide every
 // note around it. `clipText` keeps the START, which for a note is where it says what it is about.
 const NOTE_MAX_CHARS = 2_000;
+// A label-change line is "<somebody> <verb> <label>", and each of the three is short. This block
+// rides on every observation of a conversation whose label has moved and a tick costs about
+// US$ 0.0005 today, so the line has a size it must fit in — but it is a REFUSAL and not a cut
+// (issue #642, round 14): a clipped sentence loses the later labels of a multi-label change, and in
+// a verb-final language it loses the verb.
+const LABEL_CHANGE_MAX_CHARS = 200;
+const LABEL_CHANGES_MAX = 8;
 // NOTE: `notas-internas` joined the list when the notes block was added (issue #568, review round
 // 24), and it is the one whose content is WRITTEN BY PEOPLE — a colleague pasting a prompt they were
 // debugging, or a note that quoted a customer. A closing tag inside it ends the block early and
 // everything after it reads as if it were outside the notes, which is the same escape the transcript
 // closed on day one.
+// NOTE: `mudancas-de-etiqueta` joined it with the label-history block (issue #642): its content is
+// Chatwoot's own sentence around a LABEL, and a label is a string the model wrote (the tag list
+// accepts what the account's catalog would refuse), so the closing tag can arrive inside it.
 const FENCE_TAG =
-  /<\s*\/?\s*(transcricao|etiquetas-atuais|notas-internas)[^>]*>/gi;
+  /<\s*\/?\s*(transcricao|etiquetas-atuais|notas-internas|mudancas-de-etiqueta)[^>]*>/gi;
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -473,12 +486,27 @@ function quotesResolved(
 // What is left is the frame the agent cannot know on its own: it is reading, not answering, and
 // there is no reply channel this turn. The last line is the one that keeps a tick cheap: a
 // conversation where nothing changed should cost one model call and no writes.
+// What the block renders: the lines it recognised, and whether that is ALL of them. Two claims and
+// not one, because a line can be recognised in a window whose reading was still incomplete — a
+// change too long to scan or to show, or a recognition source that did not answer. `complete` is
+// deliberately not a count: a failed source leaves no number, and a note that invents one would be
+// a more precise claim than the evidence supports.
+export interface LabelHistoryForPrompt {
+  lines: readonly string[];
+  complete: boolean;
+}
+
 export function observeTurnText(
   transcript: readonly TranscriptLine[],
   // `null` is "we could not read them", which is NOT "there are none": the second is what makes a
   // model clear a conversation it never saw the labels of (review round 33).
   current: readonly string[] | null,
   notes: readonly string[] = [],
+  // `null` is "no vocabulary to recognise a label change by", which is not "nothing changed": the
+  // block says which of the two it is (issue #642). Otherwise it is the history itself, the lines
+  // AND whether they are all of them, because the block has to be able to make a third claim:
+  // HERE IS WHAT I READ, AND IT IS NOT ALL OF IT (round 17).
+  labelChanges: LabelHistoryForPrompt | null = null,
 ): string {
   return [
     "Turno de observação: você está acompanhando esta conversa e NÃO responde a ninguém.",
@@ -529,10 +557,227 @@ export function observeTurnText(
         : "(nenhuma nesta janela)"
     }</notas-internas>`,
     "",
+    // WHAT ALREADY CHANGED ON THIS CONVERSATION, for the same reason the two blocks above exist: a
+    // decision the model cannot see is a decision it makes again. Rendered even when empty, and
+    // saying which kind of empty — a block that disappears teaches nothing, while "(nenhuma nesta
+    // janela)" is the evidence that the label standing now has been standing since the window
+    // opened.
+    // A PARTIAL READING SAYS SO WHILE STILL SHOWING WHAT IT HAS (round 17). Lines that were
+    // recognised are read, whatever else was not, and dropping them costs the model the changes it
+    // CAN see; but handing them over silently makes an incomplete list look complete, which is the
+    // same licence to decide again that "(nenhuma nesta janela)" would be. So the block carries
+    // both: the lines, and that they are not all of them. With no line left to show, incomplete is
+    // the whole answer and the block says it could not read.
+    `<mudancas-de-etiqueta escopo="janela-lida"${
+      labelChanges !== null && !labelChanges.complete
+        ? ' leitura="incompleta"'
+        : ""
+    }>${
+      labelChanges === null
+        ? "(não foi possível ler)"
+        : labelChanges.lines.length
+          ? `\n${labelChanges.lines.map((c) => `- ${c}`).join("\n")}\n${
+              labelChanges.complete
+                ? ""
+                : "(houve mudança nesta janela que não pôde ser lida: esta lista não está completa)\n"
+            }`
+          : labelChanges.complete
+            ? "(nenhuma nesta janela)"
+            : "(não foi possível ler)"
+    }</mudancas-de-etiqueta>`,
+    "",
     "<transcricao>",
     renderTranscript(transcript),
     "</transcricao>",
   ].join("\n");
+}
+
+// A line longer than this is not one of Chatwoot's sentences with a handful of titles in it, and
+// refusing to scan it is also what keeps 74 patterns off text nobody bounded.
+const ACTIVITY_SCAN_MAX_CHARS = 2_000;
+
+// DOES THIS LINE NAME A GUARDED LABEL ANYWHERE IN IT, as a word and not as a fragment. Asked beside
+// the titles the template names, because the two are different questions: a title can also land in
+// the ACTOR's half of the sentence (an agent whose display name is the guarded label), and the
+// guard's promise is that the model never sees the string, not that it never sees it in one
+// position. The list is at most 50 titles (`settings.setLabels.protected`).
+function namesGuardedTitle(text: string, guard: ReadonlySet<string>): boolean {
+  const boundary = (ch: string | undefined) =>
+    ch === undefined || !/[\p{L}\p{N}]/u.test(ch);
+  for (const title of guard) {
+    if (title.length === 0) continue;
+    for (
+      let at = text.indexOf(title);
+      at >= 0;
+      at = text.indexOf(title, at + 1)
+    ) {
+      if (boundary(text[at - 1]) && boundary(text[at + title.length])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// WHAT WAS ALREADY DECIDED ON THIS CONVERSATION, in Chatwoot's own words (issue #642).
+//
+// A tick is stateless on purpose, and the frame says so: what the agent already did is in what is
+// RECORDED on the conversation. The labels standing right now are recorded and the model gets them.
+// The CHANGES are recorded too — Chatwoot writes one activity line per label added or removed — and
+// those were dropped from the window with the rest of the system's narration, so the model could not
+// tell a label that has been there since the first message from one it has already put on and taken
+// off twice in four minutes. Measured on one install over 12 hours: 676 category changes, 161
+// conversations going A to B and back to A, and 42% of the conversations that changed ending in the
+// category they started in.
+//
+// SHOWN VERBATIM. The activity row carries no sender and no `content_attributes` (measured:
+// `message_type=2`, `content_type=0`, `sender_id` null) — the only thing there is the sentence
+// Chatwoot localized ("Fulano adicionou cancelamento"). Rewriting it would mean composing grammar in
+// the account's language; forwarded whole, the actor, the verb and the label survive in every
+// language, and a human's change reads as a human's.
+//
+// SELECTED BY THE TEMPLATE CHATWOOT RENDERED IT FROM, and never by a guess about where the labels
+// sit in the sentence (round 5). `labelsNarrated` (chatwoot/label-activity.ts) holds the 74 strings
+// `conversations.activity.labels.added` and `.removed` take across every locale the fork ships, and
+// answers which titles a line names, or that no template rendered it. Guessing at the position is
+// what the rounds before it kept paying for: a run of known titles at the edge of the line misses
+// German and Turkish, which put it in the middle, and the quoted form that Japanese needs accepts
+// any other activity that quotes a value, a priority change or a group rename among them.
+//
+// THE TITLES IT NAMES STILL HAVE TO BE LABELS THIS ACCOUNT HAS, so a display name carrying a
+// template's own words ("João adicionou vip" as somebody's name) cannot narrate a change that never
+// happened. The check is against the account's catalog AND the conversation's own tags, which in
+// Chatwoot are two different tables: `/labels` answers from `Label`, filled by an operator in
+// Settings, while a tag attached through `set_labels` goes through acts_as_taggable_on and creates
+// no row there. A title the model invented is therefore in no catalog at any TTL, and the
+// conversation carrying it is the only place it can be recognised from (round 4).
+//
+// A ROW THAT DECLARES ITS OWN KIND IS NOT READ AT ALL. `content_attributes.activity.type` is the
+// only structural field an activity row has, and a label change never sets it: the label, assignee,
+// team, priority and SLA handlers all pass the sentence with no bag, while a status change writes
+// `conversation_status_changed` (round 2).
+//
+// THE GUARDED LABELS ARE SUBTRACTED, the way they are everywhere else the model can see
+// (`modelVisibleLabels`, `set_labels`): a line that names one is refused whole rather than edited,
+// because the guard's list may not reach the prompt in Chatwoot's sentence any more than in the
+// block above it, and a change nobody asked the model to make is not history it should reason from.
+// The ceiling on that list does NOT apply here: 40 is how many titles may be SHOWN, while this only
+// has to RECOGNISE them, and a label past the fortieth still gets put on conversations.
+export interface LabelHistory {
+  lines: string[];
+  // Lines that ARE changes and could not be shown whole. Non-zero means the block may not claim the
+  // window was quiet, for the same reason a failed read may not (round 14).
+  omitted: number;
+}
+
+// THE RESET'S OWN CLEANUP IS NOT THIS EPISODE'S HISTORY (round 20). `reset_at_message_id` is the id
+// of the `/reset` MESSAGE, and the command clears the labels a dozen Chatwoot calls later, so the
+// removal activity Chatwoot writes for that clear lands ABOVE the boundary and survives the filter
+// every other block is protected by. The next tick then reads "Fulano removeu compra-de-ingresso" —
+// the erased episode's labels, named, and read by a stateless observer as a reason not to put that
+// label back, which is the opposite of what the operator was told happened.
+//
+// The cut is the ACKNOWLEDGEMENT'S OWN ROW, found by the name the command wrote into it
+// (`resetAckSendId`, constants.ts). `/reset` posts it only once every cleanup step has run, so it
+// is the latest point in the command this side can name. The first version cut at the first row
+// that was not narration, and a customer message landing inside the cleanup takes that place and
+// lets the removal through; it also never stopped applying, so once the window had slid past the
+// reset it went on dropping legitimate activity rows before the window's oldest message (round 21).
+//
+// BEST-EFFORT, AND THE LIMIT IS CHATWOOT'S, NOT THIS CUT'S (round 22). The label-change activity is
+// not written by the labels request: `LabelActivityMessageHandler#create_label_change_activity`
+// hands it to `Conversations::ActivityMessageJob.perform_later`, so the row appears whenever that
+// Sidekiq job runs. Normally that is well inside the dozen calls still ahead of the acknowledgement;
+// on an install whose queues are backed up (which this one has been) the job can land after it, and
+// then the row keeps an id above the ack and this filter does not see it. Nothing on the row says
+// who caused it — a label change writes no `content_attributes` at all — so no ordering and no
+// content test separates the two. What is left showing is a TRUE sentence about a label that really
+// was removed, on a conversation in test mode, and the residual is written down in the PR and in
+// docs/chatwoot.md rather than papered over with a time window.
+//
+// NO MARKER, NO CUT. A reset performed before this name existed, or one whose acknowledgement never
+// landed, leaves nothing that says where its cleanup ended, and a guess there is what round 21 was
+// about. Those conversations read the way they did before this block existed.
+//
+// A human who changed a label between the command and its acknowledgement loses their line too,
+// which is a miss, the direction this block fails in on purpose.
+export function afterResetNarration(
+  rows: ChatwootMessageRow[],
+  resetBoundary: number | null,
+): ChatwootMessageRow[] {
+  if (resetBoundary === null) return rows;
+  const marker = resetAckSendId(resetBoundary);
+  const ack = rows.find((r) => r.sendId === marker);
+  if (ack === undefined) return rows;
+  return rows.filter((r) => r.messageType !== "activity" || r.id > ack.id);
+}
+
+export function labelHistoryFromRows(
+  rows: ChatwootMessageRow[],
+  vocabulary: readonly string[] | null,
+  guarded: readonly string[] | undefined,
+  limit: number,
+): LabelHistory {
+  if (vocabulary === null) return { lines: [], omitted: 0 };
+  const guard = new Set(guarded ?? []);
+  const known = new Set(
+    vocabulary.map((l) => l.trim()).filter((l) => l !== ""),
+  );
+  if (known.size === 0) return { lines: [], omitted: 0 };
+  // A row too long to SCAN is a row nobody read, so it is counted like the one too long to SHOW
+  // (round 16). `set_labels` takes an unbounded list, so a batch big enough to push its own activity
+  // sentence past the scan limit is something this application produces, and dropping it quietly let
+  // the block report `(nenhuma nesta janela)` over the very change the model had just made. The
+  // guard is checked FIRST and stays silent: its promise is that the string does not reach the
+  // model, and a count that only appears on conversations carrying a guarded label reports it.
+  let unread = 0;
+  const recognised = rows
+    .filter((m) => {
+      if (m.messageType !== "activity" || m.private) return false;
+      if (m.activityType !== null) return false;
+      if (namesGuardedTitle(m.content, guard)) return false;
+      if (m.content.length > ACTIVITY_SCAN_MAX_CHARS) {
+        // ...AND ONLY IF IT COULD HAVE BEEN ONE (round 21). Recognition needs EVERY title the line
+        // names to be a label this account has, so a sentence carrying none of them cannot be a
+        // change under any reading — an imported activity with a long body is the ordinary case.
+        // Counting it made the block announce a hidden label change over a row where no label
+        // moved. The substring test is looser than the reading that would follow, which is the
+        // right direction: it over-counts rather than claiming a quiet window.
+        if ([...known].some((t) => m.content.includes(t))) unread += 1;
+        return false;
+      }
+      const readings = labelsNarrated(m.content);
+      if (readings.length === 0) return false;
+      // ANY reading naming a guarded label refuses the line: the guard's promise is about the
+      // string reaching the model, and a locale that glues a particle onto the title (Korean writes
+      // `vip을(를)`) puts it out of reach of the scan above, which asks for a word boundary the
+      // sentence does not have (round 7).
+      if (readings.some((ts) => ts.some((t) => guard.has(t)))) return false;
+      // And ONE reading whose titles this account actually has is what makes the line a change.
+      return readings.some((ts) => ts.every((t) => known.has(t)));
+    })
+    .sort((a, b) => a.id - b.id);
+  // THE CAP HIDES CHANGES TOO (round 18). `escopo="janela-lida"` says where the block looked, not
+  // that everything it found is in it, and a conversation with more than `limit` changes in one
+  // window is the oscillation this whole block exists for. Showing the newest eight as if they were
+  // all of them is the same false completeness a silent drop would be, so what the cap removes is
+  // counted like everything else nobody could show.
+  const capped = Math.max(0, recognised.length - limit);
+  const changes = recognised
+    .slice(-limit)
+    .map((m) =>
+      stripFences(m.content)
+        .trim()
+        .replace(/\s*\n\s*/g, " "),
+    )
+    .filter((t) => t.length > 0);
+  // WHOLE OR NOT AT ALL (round 14). Clipping a sentence to its first 200 characters drops the later
+  // labels of a multi-label change, and in a verb-final language it drops the VERB: "Hans hat vip,
+  // …, x hinzugefügt" cut short says somebody did something to those labels and not which thing,
+  // which is worse than not knowing. So an over-long line is left out and counted, and the count is
+  // what stops the block from reporting the window as quiet.
+  const lines = changes.filter((t) => t.length <= LABEL_CHANGE_MAX_CHARS);
+  return { lines, omitted: changes.length - lines.length + unread + capped };
 }
 
 // The private notes already on the conversation, oldest first, newest `limit`. Written by anyone —
@@ -995,6 +1240,40 @@ export async function runObserve(
   const currentForPrompt =
     current === null ? null : modelVisibleLabels(current, cfg.protectedLabels);
 
+  // WHAT ALREADY CHANGED, beside what is standing now, and read here rather than beside `notes`
+  // because this is a request: every exit above it (no customer message, agent off, window empty)
+  // would pay for a Chatwoot round trip on a cold cache and then throw the answer away.
+  //
+  // THE LABELS ALONE, and not the vocabulary the toolset reads (round 10). That one is two requests
+  // under a single `Promise.all` — the labels and the custom attribute DEFINITIONS — so an attribute
+  // endpoint that is down fails the pair, caches nothing, and would make every tick of every
+  // conversation wait out its timeout before this block could look at a catalog that answered fine.
+  // `loadChatwootLabels` answers from the combined entry while it is warm and keeps its own
+  // otherwise, so the toolset still pays for its read once and this pays for nothing twice.
+  // Best-effort like the labels above: `null` makes the block say it could not be read, rather than
+  // claim that nothing ever changed.
+  const vocabLabels = await loadChatwootLabels(
+    client,
+    `${tenantId}:${instanceId}`,
+  ).catch(() => null);
+  // THE CONVERSATION'S OWN LABELS JOIN THE INDEX, and they are not a nicety (round 4). The account
+  // catalog and the conversation's tags are two different tables in Chatwoot: `/labels` answers from
+  // `Label`, which an operator fills in Settings, while a tag attached through `set_labels` goes
+  // through acts_as_taggable_on and creates NO row there. So a title the model invented is never in
+  // the catalog, at any TTL — the only place it shows up is the conversation carrying it, which this
+  // tick has already read. Union, so an invented label's own history is recognisable while it is
+  // standing; a title invented, applied and taken off between two ticks is in neither list and its
+  // lines are not read, which is the miss this block chooses over inventing a decision.
+  const labelChanges = labelHistoryFromRows(
+    // Minus the reset's own cleanup, which lands above the boundary the filter above uses.
+    afterResetNarration(rows, resetBoundary),
+    vocabLabels === null && current === null
+      ? null
+      : [...(vocabLabels ?? []), ...(current ?? [])],
+    cfg.protectedLabels,
+    LABEL_CHANGES_MAX,
+  );
+
   // THE TURN ITSELF, and from here on this is the ordinary graph (issue #568). What used to sit in
   // these lines was a classifier: one model call with a JSON schema built from the operator's label
   // groups, then a deterministic apply that wrote the verdict. It existed because `loadAgentConfig`
@@ -1420,7 +1699,26 @@ export async function runObserve(
         {
           messages: [
             new HumanMessage(
-              observeTurnText(transcript, currentForPrompt, notes),
+              observeTurnText(
+                transcript,
+                currentForPrompt,
+                notes,
+                // EMPTY IS A CLAIM, so it is only made when BOTH lists were read (round 8). Each
+                // one recognises changes the other cannot — the catalog knows a label removed
+                // during the window, which is gone from the conversation's set, and the
+                // conversation knows a title the model invented, which is in no catalog — so with
+                // one of them missing, "nothing changed here" is exactly the sentence a stateless
+                // observer would take as licence to decide again. Lines that WERE recognised are
+                // still shown: those are read, whatever else was not, and a read that was missing a
+                // source is handed over as incomplete rather than silently as complete (round 17).
+                {
+                  lines: labelChanges.lines,
+                  complete:
+                    vocabLabels !== null &&
+                    current !== null &&
+                    labelChanges.omitted === 0,
+                },
+              ),
             ),
           ],
         },

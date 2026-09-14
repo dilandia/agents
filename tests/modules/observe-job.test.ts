@@ -2981,7 +2981,24 @@ describe.skipIf(!dbUp)("the OBSERVE job", () => {
   // both a contradiction to reason from and the invitation the guard exists to withdraw (round 12).
   test("a guarded label is absent from the prompt, and survives the write", async () => {
     const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
-    const client = stubClient([message(1, "quero cancelar")], [], log);
+    __resetChatwootVocabCache();
+    // ISSUE #642, ROUND 1: the third model-facing place is the label HISTORY, and it is the one
+    // that would name the guarded label in Chatwoot's own sentence. The vocabulary knows
+    // `agente-off`, so a line about it is recognisable — and has to drop out all the same.
+    const client = stubClientWithVocab(
+      [
+        message(1, "quero cancelar"),
+        message(2, "Fulano adicionou agente-off", "incoming", {
+          message_type: 2,
+        }),
+        message(3, "Fulano adicionou cancelamento", "incoming", {
+          message_type: 2,
+        }),
+      ],
+      [],
+      log,
+      ["cancelamento", "compra-de-ingresso", "agente-off"],
+    );
     (client as { getConversationLabels: unknown }).getConversationLabels =
       async () => ["agente-off", "compra-de-ingresso"];
     let prompt = "";
@@ -3042,8 +3059,11 @@ describe.skipIf(!dbUp)("the OBSERVE job", () => {
         },
       );
       expect(res).toEqual({ outcome: "done" });
-      // Neither the labels block in the prompt nor the tool's own description names it.
+      // Neither the labels block in the prompt, nor the history block, nor the tool's own
+      // description names it — while the change beside it is there, so the line dropped for being
+      // about the guarded label and not for the block being empty.
       expect(prompt).toContain("compra-de-ingresso");
+      expect(prompt).toContain("Fulano adicionou cancelamento");
       expect(prompt).not.toContain("agente-off");
       const labelsTool = seenTools.find((d) => d.includes("current_labels"));
       expect(labelsTool).toBeDefined();
@@ -3757,5 +3777,447 @@ describe.skipIf(!dbUp)("the OBSERVE job", () => {
         data: { settings: { monitoring: MONITORING } },
       });
     }
+  });
+
+  // ISSUE #642. The label changes are activity rows, which the transcript drops on purpose; without
+  // them the model cannot tell a label that never moved from one it has already flipped twice.
+  test("the tick shows the model the label changes already recorded on the conversation", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    let prompt = "";
+    await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () =>
+          stubClientWithVocab(
+            [
+              message(1, "quero cancelar"),
+              message(
+                2,
+                "Classificador SAC adicionou compra-de-ingresso",
+                "incoming",
+                {
+                  message_type: 2,
+                },
+              ),
+              message(
+                3,
+                "Assigned to Gi - Agente IA by Automation System",
+                "incoming",
+                {
+                  message_type: 2,
+                },
+              ),
+              message(
+                4,
+                "Classificador SAC removeu compra-de-ingresso",
+                "incoming",
+                {
+                  message_type: 2,
+                },
+              ),
+            ],
+            ["cancelamento"],
+            log,
+            ["cancelamento", "compra-de-ingresso"],
+          ),
+        makeModel: () => {
+          const m = new SilentModel() as unknown as BaseChatModel;
+          const bind = (m as unknown as { bindTools: (t: unknown) => unknown })
+            .bindTools;
+          (m as unknown as { bindTools: (t: unknown) => unknown }).bindTools = (
+            tools: unknown,
+          ) => {
+            const bound = bind.call(m, tools) as {
+              invoke: (msgs: unknown) => Promise<unknown>;
+            };
+            const inner = bound.invoke.bind(bound);
+            bound.invoke = async (msgs: unknown) => {
+              prompt = JSON.stringify(msgs);
+              return inner(msgs);
+            };
+            return bound;
+          };
+          return m;
+        },
+      },
+    );
+    expect(prompt).toContain("mudancas-de-etiqueta");
+    expect(prompt).toContain("Classificador SAC adicionou compra-de-ingresso");
+    expect(prompt).toContain("Classificador SAC removeu compra-de-ingresso");
+    // The narration that is not about a label stays out.
+    expect(prompt).not.toContain("Automation System");
+    // And the transcript still counts messages, not activity.
+    expect(prompt).toContain("quero cancelar");
+  });
+
+  // ISSUE #642, ROUND 4. The account catalog and the conversation's tags are two different tables:
+  // `/labels` answers from `Label`, which an operator fills in Settings, and a tag `set_labels`
+  // attaches goes through acts_as_taggable_on without creating a row there. So a title the model
+  // invented is in no catalog at any TTL, and the conversation carrying it is the only place its own
+  // history can be recognised from.
+  test("a label the catalog never had is recognised from the conversation", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    let prompt = "";
+    const client = stubClientWithVocab(
+      [
+        message(1, "quero cancelar"),
+        message(
+          2,
+          "Classificador SAC adicionou inventada-pelo-modelo",
+          "incoming",
+          {
+            message_type: 2,
+          },
+        ),
+      ],
+      ["inventada-pelo-modelo"],
+      log,
+      // The catalog does not have it, and never will.
+      ["cancelamento"],
+    );
+    await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () => client,
+        makeModel: () => {
+          const m = new SilentModel() as unknown as BaseChatModel;
+          const bind = (m as unknown as { bindTools: (t: unknown) => unknown })
+            .bindTools;
+          (m as unknown as { bindTools: (t: unknown) => unknown }).bindTools = (
+            tools: unknown,
+          ) => {
+            const bound = bind.call(m, tools) as {
+              invoke: (msgs: unknown) => Promise<unknown>;
+            };
+            const inner = bound.invoke.bind(bound);
+            bound.invoke = async (msgs: unknown) => {
+              prompt = JSON.stringify(msgs);
+              return inner(msgs);
+            };
+            return bound;
+          };
+          return m;
+        },
+      },
+    );
+    expect(prompt).toContain(
+      "Classificador SAC adicionou inventada-pelo-modelo",
+    );
+  });
+
+  // ISSUE #642, ROUND 6. The cached vocabulary is two requests under one `Promise.all`: the labels
+  // and the custom attribute DEFINITIONS. An attribute endpoint that fails took a perfectly good
+  // label catalog down with it, and this block needs only the labels.
+  test("an attribute endpoint that fails does not cost the label catalog", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    let prompt = "";
+    const client = {
+      ...stubClient(
+        [
+          message(1, "quero cancelar"),
+          message(2, "Classificador SAC adicionou cancelamento", "incoming", {
+            message_type: 2,
+          }),
+        ],
+        [],
+        log,
+      ),
+      listLabels: async () => ["cancelamento"],
+      listCustomAttributeDefinitions: async () => {
+        throw new Error("attribute definitions are down");
+      },
+    } as unknown as ChatwootClient;
+    await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () => client,
+        makeModel: () => {
+          const m = new SilentModel() as unknown as BaseChatModel;
+          const bind = (m as unknown as { bindTools: (t: unknown) => unknown })
+            .bindTools;
+          (m as unknown as { bindTools: (t: unknown) => unknown }).bindTools = (
+            tools: unknown,
+          ) => {
+            const bound = bind.call(m, tools) as {
+              invoke: (msgs: unknown) => Promise<unknown>;
+            };
+            const inner = bound.invoke.bind(bound);
+            bound.invoke = async (msgs: unknown) => {
+              prompt = JSON.stringify(msgs);
+              return inner(msgs);
+            };
+            return bound;
+          };
+          return m;
+        },
+      },
+    );
+    expect(prompt).toContain("Classificador SAC adicionou cancelamento");
+  });
+
+  // ISSUE #642, ROUND 8. Each list recognises changes the other cannot, so with one of them missing
+  // "nothing changed here" is the one sentence a stateless observer would take as licence to decide
+  // again. It says it could not read instead.
+  test("an empty window is only claimed when both label reads succeeded", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    let prompt = "";
+    const client = {
+      ...stubClient([message(1, "quero cancelar")], [], log),
+      listLabels: async () => {
+        throw new Error("labels are down");
+      },
+      listCustomAttributeDefinitions: async () => [],
+    } as unknown as ChatwootClient;
+    await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () => client,
+        makeModel: () => {
+          const m = new SilentModel() as unknown as BaseChatModel;
+          const bind = (m as unknown as { bindTools: (t: unknown) => unknown })
+            .bindTools;
+          (m as unknown as { bindTools: (t: unknown) => unknown }).bindTools = (
+            tools: unknown,
+          ) => {
+            const bound = bind.call(m, tools) as {
+              invoke: (msgs: unknown) => Promise<unknown>;
+            };
+            const inner = bound.invoke.bind(bound);
+            bound.invoke = async (msgs: unknown) => {
+              prompt = JSON.stringify(msgs);
+              return inner(msgs);
+            };
+            return bound;
+          };
+          return m;
+        },
+      },
+    );
+    expect(prompt).toContain("não foi possível ler");
+    // The notes block is the only one entitled to claim an empty window here.
+    expect(prompt.match(/\(nenhuma nesta janela\)/g)?.length).toBe(1);
+  });
+
+  // ISSUE #642, ROUND 20. The reset's boundary is the /reset MESSAGE's id, and the command clears
+  // the labels a dozen Chatwoot calls later, so the removal activity lands ABOVE it and survives the
+  // filter the transcript is protected by. The next tick would read the erased episode's labels,
+  // named, as a reason not to put them back.
+  test("the reset's own label cleanup never reaches the prompt", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    let prompt = "";
+    await suDb.conversation.update({
+      where: { id: convRowId },
+      data: { resetAtMessageId: 700 },
+    });
+    try {
+      const client = stubClientWithVocab(
+        [
+          // The reset's own cleanup: above the boundary, before anything was said since.
+          message(701, "Fulano removeu compra-de-ingresso", "incoming", {
+            message_type: 2,
+            sender: null,
+          }),
+          // The acknowledgement carries the name the command wrote into it, which is what says
+          // where the cleanup ended (round 21).
+          message(702, "🧪 Conversa limpa.", "outgoing", {
+            content_attributes: { fazer_ai_send_id: "reset-ack:700" },
+          }),
+          message(703, "quero cancelar"),
+          // And a change this episode actually made.
+          message(704, "Classificador SAC adicionou cancelamento", "incoming", {
+            message_type: 2,
+            sender: null,
+          }),
+        ],
+        [],
+        log,
+        ["compra-de-ingresso", "cancelamento"],
+      );
+      await runObserve(
+        tenantId,
+        {
+          instanceId,
+          conversationId: CONV,
+          agentId,
+          reason: "burst",
+          atMessageId: 704,
+        },
+        appDb,
+        {
+          makeClient: async () => client,
+          makeModel: () => {
+            const m = new SilentModel() as unknown as BaseChatModel;
+            const bind = (
+              m as unknown as { bindTools: (t: unknown) => unknown }
+            ).bindTools;
+            (m as unknown as { bindTools: (t: unknown) => unknown }).bindTools =
+              (tools: unknown) => {
+                const bound = bind.call(m, tools) as {
+                  invoke: (msgs: unknown) => Promise<unknown>;
+                };
+                const inner = bound.invoke.bind(bound);
+                bound.invoke = async (msgs: unknown) => {
+                  prompt = JSON.stringify(msgs);
+                  return inner(msgs);
+                };
+                return bound;
+              };
+            return m;
+          },
+        },
+      );
+      expect(prompt).toContain("Classificador SAC adicionou cancelamento");
+      expect(prompt).not.toContain("Fulano removeu compra-de-ingresso");
+    } finally {
+      await suDb.conversation.update({
+        where: { id: convRowId },
+        data: { resetAtMessageId: null },
+      });
+    }
+  });
+
+  // ISSUE #642, ROUND 17. The mixed window: the catalog is down, so the reading is incomplete, but
+  // the conversation's own labels still recognise a change. Dropping the line costs the model the
+  // change it CAN see; handing it over silently makes an incomplete list look complete, which is
+  // the same licence to decide again. The block does both.
+  test("a partial read still shows the lines it recognised, marked incomplete", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    let prompt = "";
+    const client = {
+      ...stubClient(
+        [
+          message(1, "quero cancelar"),
+          message(2, "Ana adicionou vip", "incoming", {
+            message_type: 2,
+            sender: null,
+          }),
+        ],
+        ["vip"],
+        log,
+      ),
+      listLabels: async () => {
+        throw new Error("labels are down");
+      },
+      listCustomAttributeDefinitions: async () => [],
+    } as unknown as ChatwootClient;
+    await runObserve(
+      tenantId,
+      {
+        instanceId,
+        conversationId: CONV,
+        agentId,
+        reason: "burst",
+        atMessageId: null,
+      },
+      appDb,
+      {
+        makeClient: async () => client,
+        makeModel: () => {
+          const m = new SilentModel() as unknown as BaseChatModel;
+          const bind = (m as unknown as { bindTools: (t: unknown) => unknown })
+            .bindTools;
+          (m as unknown as { bindTools: (t: unknown) => unknown }).bindTools = (
+            tools: unknown,
+          ) => {
+            const bound = bind.call(m, tools) as {
+              invoke: (msgs: unknown) => Promise<unknown>;
+            };
+            const inner = bound.invoke.bind(bound);
+            bound.invoke = async (msgs: unknown) => {
+              prompt = JSON.stringify(msgs);
+              return inner(msgs);
+            };
+            return bound;
+          };
+          return m;
+        },
+      },
+    );
+    expect(prompt).toContain("Ana adicionou vip");
+    expect(prompt).toContain('leitura=\\"incompleta\\"');
+    expect(prompt).toContain("não está completa");
+  });
+
+  // The vocabulary is a REQUEST, and every exit above the turn is an exit that costs nothing today.
+  // Reading it beside the notes would put a Chatwoot round trip on a cold cache in front of a tick
+  // that is about to throw the answer away (issue #642).
+  test("a tick that ends before the turn never reads the vocabulary", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    __resetChatwootVocabCache();
+    const log: ClientLog = { labelsWritten: [], notes: [], publicSends: 0 };
+    const vocab = { n: 0 };
+    expect(
+      await runObserve(
+        tenantId,
+        {
+          instanceId,
+          conversationId: CONV,
+          agentId,
+          reason: "burst",
+          atMessageId: null,
+        },
+        appDb,
+        {
+          makeClient: async () =>
+            ({
+              ...stubClient([message(1, "Olá!", "outgoing")], [], log),
+              listLabels: async () => {
+                vocab.n++;
+                return ["cancelamento"];
+              },
+              listCustomAttributeDefinitions: async () => [],
+            }) as unknown as ChatwootClient,
+          makeModel: () => new SilentModel() as unknown as BaseChatModel,
+        },
+      ),
+    ).toEqual({ outcome: "done" });
+    expect(detailOf(await observeLines(), -1).skipped).toBe(
+      "no_customer_message",
+    );
+    expect(vocab.n).toBe(0);
   });
 });
