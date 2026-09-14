@@ -1286,6 +1286,9 @@ export async function runObserve(
       makeModel: deps.makeModel,
       checkpointer,
       stillWanted: () => fence(),
+      // NOTE: the tick's frame says the model answers nobody, so the tool budget's wrap-up says the
+      // same (issue #629): finish with a tool, or stop, never "responda ao cliente".
+      noReplyChannel: true,
       onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
