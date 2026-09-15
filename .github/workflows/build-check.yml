@@ -3,6 +3,7 @@ name: Build Check on PR
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - 'docs/**'
       - '**.md'
@@ -30,7 +31,9 @@ jobs:
     # agents-pro only ever receives mirror pushes of a tree this master already tested, and the
     # stripped Pro tree is lint + build-checked by `check:editions` before it is mirrored, so this
     # job is skipped there on push (see test.yml). agents (public, free) keeps running on push.
-    if: ${{ !(github.repository == 'fazer-ai/agents-pro' && github.event_name == 'push') }}
+    # No CI while the PR is a draft: the autonomous loop opens its PRs as drafts and marks them ready
+    # once the review loop is clean, so the suite runs on the final HEAD, not on every fix push.
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && !(github.repository == 'fazer-ai/agents-pro' && github.event_name == 'push')
     runs-on: ubuntu-latest
 
     steps:

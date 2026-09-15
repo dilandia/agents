@@ -3,6 +3,7 @@ name: Run Tests on PR
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - 'docs/**'
       - '**.md'
@@ -35,9 +36,12 @@ jobs:
     # copy of this workflow therefore runs on a nightly schedule and on dispatch, not on push:
     # 267 mirror pushes in August cost 1,469 paid minutes for a second verdict on the same code.
     # agents (public, free) keeps running on push as the visible proof of green.
+    # No CI while the PR is a draft: the autonomous loop opens its PRs as drafts and marks them ready
+    # once the review loop is clean, so the suite runs on the final HEAD, not on every fix push.
     if: >-
-      (github.event_name == 'schedule' && github.repository == 'fazer-ai/agents-pro')
-      || (github.event_name != 'schedule' && !(github.repository == 'fazer-ai/agents-pro' && github.event_name == 'push'))
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+      && ((github.event_name == 'schedule' && github.repository == 'fazer-ai/agents-pro')
+          || (github.event_name != 'schedule' && !(github.repository == 'fazer-ai/agents-pro' && github.event_name == 'push')))
     runs-on: ubuntu-latest
 
     strategy:
