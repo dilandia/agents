@@ -295,6 +295,19 @@ const CAPS: {
       return malformedTokenIn(`{{${s}`) ?? "";
     },
   },
+  {
+    // The operator's closing line (#599), cut on the way OUT of the settings bag. An emoji at the
+    // end of a signature is the ordinary case for this field rather than the exotic one, and an
+    // orphan half here repeats on EVERY message the agent sends instead of degrading one.
+    name: "signature: readSignatureConfig",
+    cap: 500,
+    run: async (s) => {
+      const { readSignatureConfig } = await import(
+        "@/modules/signature/service"
+      );
+      return readSignatureConfig({ signature: { text: s } }).text;
+    },
+  },
 ];
 
 describe("no text cap ever cuts an astral character in half", () => {
@@ -397,17 +410,29 @@ const BARE_SLICES: Record<
   // `clipText` like every other cap.
   "src/client/pages/AuditPage.tsx": [1, "array"],
   "src/client/pages/LogsPage.tsx": [1, "array"],
+  // The signature's own token insert, which splices at a SELECTION (#599). A caret is a position the
+  // browser maintains and it never sits between the two halves of an astral character. The two cuts
+  // in that field that DO bound the value go through `clipText`, which is the whole point of the
+  // distinction: an operator signing off with an emoji is the ordinary case here, not the exotic one.
+  "src/client/pages/agents/BehaviorTab.tsx": [1, "index"],
   "src/client/pages/agents/CapabilityMap.tsx": [1, "array"],
   "src/client/pages/agents/PlaygroundChat.tsx": [1, "array"],
   "src/client/pages/agents/PromptPanel.tsx": [1, "index"],
   "src/client/pages/agents/followUpFormState.ts": [1, "array"],
-  "src/client/pages/resources/ToolEditModal.tsx": [1, "index"],
+  // Two since #563: the token insert splices at a SELECTION, which the browser never puts inside a
+  // surrogate pair, and `eachBlockEdit` cuts at the same boundary to ask what sits on either side of
+  // it. Neither is a cap.
+  "src/client/pages/resources/ToolEditModal.tsx": [2, "index"],
   // The idempotency key's tail is a hex digest.
   "src/graph/tools/documents.ts": [1, "ascii"],
   "src/graph/tools/mcp.ts": [5, "ascii"],
   // The spend ceiling's project key is the head of a hex digest (#426).
   "src/modules/spend-ceiling/poll.ts": [1, "ascii"],
-  "src/graph/tools/native.ts": [4, "array"],
+  // Five since #568: the fifth is the ceiling on what the model is SHOWN of a scope's labels,
+  // applied to the write report. An array of label titles, so the cut cannot land inside one.
+  "src/graph/tools/native.ts": [5, "array"],
+  // The same ceiling at its source, over the same array of titles (graph/tools/label-view.ts).
+  "src/graph/tools/label-view.ts": [1, "array"],
   "src/graph/tools/toolName.ts": [1, "ascii"],
   "src/graph/trace.ts": [2, "array + index"],
   "src/lib/redact.ts": [1, "array"],
@@ -421,7 +446,9 @@ const BARE_SLICES: Record<
   // so the `_2` suffix fits inside the 64 the provider allows: the value went through
   // `normalizeToolName` first, so it is `[a-z0-9_-]` and has nothing to split. (The label and the
   // description that loop clips are text, and go through `clipText` like every other.)
-  "src/modules/agents/transfer.ts": [2, "array"],
+  // Three since #568: the third clamps an imported protected-label list to its ceiling — an array
+  // of titles, never characters.
+  "src/modules/agents/transfer.ts": [3, "array"],
   "src/modules/analytics/langfuse-costs.ts": [2, "fixed-format"],
   "src/modules/api-keys/verify.ts": [1, "ascii"],
   "src/modules/appointments/settings.ts": [1, "array"],
@@ -474,7 +501,14 @@ const BARE_SLICES: Record<
   "src/modules/integrations/mappers.ts": [1, "ascii"],
   "src/modules/mcp/write-agents.ts": [1, "array"],
   "src/modules/memory/cut.ts": [2, "index + array"],
+  // Four: the transcript window, the notes window, the label-change window and the page walk. Every
+  // one is a slice of an ARRAY of rows, so none can land inside a surrogate pair.
+  "src/modules/observe/job.ts": [4, "array"],
   "src/modules/playground/service.ts": [1, "array"],
+  // The balloon's own LINES, cut from the array `split("\n")` returned, to ask whether the run at
+  // either end of it is the model's copy of the signature. An array of strings, never a string, so
+  // no cut can land inside a code point; and the pieces are compared, never sent.
+  "src/modules/signature/service.ts": [2, "array"],
   // Two, since the overflow merge carries the separators beside the chunks (issue #429): both are
   // slices of an ARRAY of already-split strings, so neither can land inside a surrogate pair.
   "src/modules/split/service.ts": [2, "array"],
@@ -485,7 +519,12 @@ const BARE_SLICES: Record<
   // How many items the picker samples for a block's fields: entries, never characters. The block
   // itself renders by index under a text budget, and the per-value cut inside an item goes
   // through clipText like every other.
-  "src/modules/tool-definitions/response-template.ts": [1, "array"],
+  //
+  // The second, since #563, is `templateWriteAt` cutting the document at the CARET to read what the
+  // operator has typed since `{{`. A caret is a position CodeMirror maintains, and it never sits
+  // inside a surrogate pair; the result is parsed, never shown, so a cut there could not truncate
+  // anything in front of a reader either.
+  "src/modules/tool-definitions/response-template.ts": [2, "array"],
   "src/modules/updates/semver.ts": [1, "array"],
   // Read only to be substring-matched against the provider's auth-failure shapes, then dropped:
   // never stored, never shown, never sent anywhere.

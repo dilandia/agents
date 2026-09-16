@@ -1,5 +1,8 @@
+import logger from "@/api/lib/logger";
 import { withKeyedQueue } from "@/lib/locks";
+import { withDeadline } from "@/lib/outbound";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
+import { redactEndpoint } from "@/modules/audit/projection";
 import { CHATWOOT_AUTH_HEADER, CHATWOOT_SEND_ID_KEY } from "./constants";
 
 // Chatwoot Application API client with the dual-identity profiles (validated against the
@@ -40,6 +43,11 @@ const realSleep = (ms: number): Promise<void> =>
 export class ChatwootApiError extends Error {
   readonly status: number;
   readonly endpoint: string;
+  // The auth failure's reason, verbatim, when Chatwoot named one (see `authFailureDetail`). Kept as
+  // a field and not only inside the message because a caller has to be able to tell WHICH refusal it
+  // got — "this endpoint is not open to bots" and "this token is no good" are both 401 and mean
+  // opposite things (issue #493 review, round 1).
+  readonly reason?: string;
   constructor(status: number, endpoint: string, detail?: string) {
     // NOTE: `detail` is ONLY ever an auth failure's reason (see authFailureDetail) — the response body
     // of any other status carries customer PII / message content and must never reach this message.
@@ -51,6 +59,7 @@ export class ChatwootApiError extends Error {
     this.name = "ChatwootApiError";
     this.status = status;
     this.endpoint = endpoint;
+    this.reason = detail;
   }
 }
 
@@ -80,11 +89,17 @@ export class ChatwootMissingTokenError extends Error {
 // answer whatever it likes, including `{"error":"<customer data>"}`, which would land in shared logs
 // through the callers' `errMsg(err)`. An allowlist keeps the three cases this exists to separate and
 // gives up on everything else, which is exactly the old behavior for anything unrecognized.
+// The ONE refusal that means "this server does not open this endpoint to bots", as opposed to the
+// two that mean "this bot's token is no good". Named because the label write below is allowed to
+// answer them differently, and only this one.
+export const BOT_ENDPOINT_NOT_AUTHORIZED =
+  "Access to this endpoint is not authorized for bots";
+
 const KNOWN_AUTH_REASONS: ReadonlySet<string> = new Set([
   // access_token_auth_helper.rb: the token is blank or matches no user.
   "Invalid Access Token",
   // access_token_auth_helper.rb: the endpoint is outside BOT_ACCESSIBLE_ENDPOINTS.
-  "Access to this endpoint is not authorized for bots",
+  BOT_ENDPOINT_NOT_AUTHORIZED,
   // ensure_current_account_helper.rb: the bot belongs to another account.
   "Bot is not authorized to access this account",
   // accounts/base_controller.rb, on a 403.
@@ -117,6 +132,149 @@ export interface ChatwootClientConfig {
   accountId: number;
   adminToken: string;
   botToken: string;
+  // A CLIENT THAT CANNOT SPEAK TO THE CUSTOMER (issue #568). A monitoring agent runs the ordinary
+  // graph — its tools, its MCP, its knowledge — and the one thing it must never do is put something
+  // in front of the customer. The refusal is enforced at the TRANSPORT rather than on the methods
+  // that send today, because a list of methods is a list that the method added next week is not on.
+  //
+  // But the transport is not ONE url either, and saying it was is what let a reaction through
+  // (round 2 of review): "a sender" is not the boundary, "the customer perceives it" is. See
+  // CUSTOMER_FACING_PATHS — a message, a reaction, a typing indicator and a read receipt, three of
+  // which are not messages at all and all four of which land on the customer's phone.
+  //
+  // It is a BACKSTOP, not the mechanism: the observe path simply never delivers a reply. Reaching
+  // this refusal means something tried to, which is a defect and throws rather than passing quietly.
+  mute?: boolean;
+  // A DEADLINE FOR THE WHOLE CLIENT. Aborting a turn stops the caller waiting on it; it does NOT
+  // stop a tool handler that is already inside its own sequence of writes, and this client gives
+  // each request an independent deadline of its own. So a watcher's tick could return a retryable
+  // failure while the turn it walked away from kept mutating the conversation — and the retry then
+  // ran beside it (review r10).
+  //
+  // Enforced in the same wrapper as the mute, and for the same reason it lives there: a per-method
+  // guard is a list, and the write added next week is not on it. Once this fires the client is
+  // DONE, reads included, because there is nobody left to answer.
+  expiresOn?: AbortSignal;
+}
+
+// Thrown when a client whose deadline has passed is asked for anything. Its own class, not folded
+// into the muted one: the two say different things to whoever reads the trail — "this agent never
+// speaks to customers" against "this turn's time was up".
+export class ChatwootExpiredError extends Error {
+  constructor(endpoint: string) {
+    super(
+      `Chatwoot ${endpoint} refused: this turn's deadline passed, so nothing more is written for it.`,
+    );
+    this.name = "ChatwootExpiredError";
+  }
+}
+
+// Thrown by a muted client when something tries to post a customer-visible message. Named so a
+// caller can tell it from a Chatwoot rejection: nothing left this process.
+export class ChatwootMutedError extends Error {
+  constructor(endpoint: string) {
+    super(
+      `Chatwoot ${endpoint} refused: this client belongs to a monitoring agent, which never posts to the customer. Private notes are allowed.`,
+    );
+    this.name = "ChatwootMutedError";
+  }
+}
+
+// Thrown by a queued write whose caller withdrew the run while the write waited its turn. Named so
+// the tool can answer the model with a sentence instead of an integration failure: nothing left this
+// process, and nothing is wrong with Chatwoot.
+export class ChatwootCalledOffError extends Error {
+  constructor(endpoint: string) {
+    super(
+      `Chatwoot ${endpoint} was not sent: the run was called off while this write waited its turn.`,
+    );
+    this.name = "ChatwootCalledOffError";
+  }
+}
+
+// EVERYTHING THE CUSTOMER PERCEIVES, which is a bigger set than "everything that sends a message".
+// Each entry was checked against the fork rather than assumed:
+//
+//   messages            — sendMessage / sendTemplate / sendAudioMessage / sendFileAttachment, and
+//                         the fifth sender whoever writes it. A PRIVATE note takes this same path
+//                         and is allowed; that is the one exemption, and isPrivateSend decides it.
+//   .../reactions       — addMessageReaction, behind `react_to_message`. Lands on the customer's
+//                         own message as an emoji.
+//   toggle_typing_status— `channel_listener.rb` forwards `conversation_typing_on` to the channel
+//                         (`channel.toggle_typing_status`), so on WhatsApp the customer watches the
+//                         persona compose a reply that is never coming.
+//   read_receipt        — the fork maps it to the session's `mark_read` capability, which is what
+//                         turns the ticks blue on their phone: the customer is told somebody read.
+//
+// The label, attribute, status, assignment and kanban writes are deliberately NOT here: they are
+// internal, and a watcher exists to make them.
+const CUSTOMER_FACING_PATHS: readonly RegExp[] = [
+  /\/conversations\/\d+\/messages\/?$/,
+  /\/conversations\/\d+\/messages\/\d+\/reactions\/?$/,
+  /\/conversations\/\d+\/toggle_typing_status\/?$/,
+  /\/conversations\/\d+\/read_receipt\/?$/,
+];
+
+// The private-note exemption belongs to the MESSAGE path alone: a reaction, a typing indicator and
+// a read receipt have no private variant to check for, so a body that happened to carry
+// `private: true` must not buy one a pass.
+const PRIVATE_CAPABLE_PATH = /\/conversations\/\d+\/messages\/?$/;
+
+// Is this POST a PRIVATE note? Read off the body the caller actually built, in both shapes it can
+// take: JSON for `sendMessage`/`sendTemplate`, multipart for the attachment senders (which set no
+// `private` field at all, so they are outgoing and refused). A body that cannot be read is NOT
+// assumed private: an unparseable send is exactly the one nobody has thought about.
+function isPrivateSend(body: BodyInit | null | undefined): boolean {
+  if (typeof body === "string") {
+    try {
+      const parsed = JSON.parse(body) as { private?: unknown };
+      return parsed?.private === true;
+    } catch {
+      return false;
+    }
+  }
+  if (body instanceof FormData) return body.get("private") === "true";
+  return false;
+}
+
+// The mute itself: one wrapper around the client's own fetch, so `request` and the multipart senders
+// that build their own call are both covered without either of them knowing about it.
+function mutedFetch(
+  inner: typeof fetch,
+  mute: boolean,
+  expiresOn?: AbortSignal,
+): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    // FIRST, and before the method is even looked at: past the deadline this client answers nothing.
+    if (expiresOn?.aborted) {
+      throw new ChatwootExpiredError(new URL(url).pathname);
+    }
+    // AND THE DEADLINE RIDES ALONG, not only gates the dispatch. Each request here arms its own
+    // `AbortSignal.timeout`, so without combining the two a call that STARTED inside the budget runs
+    // to that independent timeout and lands its effect after `runObserve` has already reported the
+    // tick as failed — `recordResolutionOrigin` being the one that hurts (round 15).
+    const withBudget: RequestInit | undefined = expiresOn
+      ? { ...(init ?? {}), signal: withDeadline(init?.signal, expiresOn) }
+      : init;
+    if (!mute) return inner(input, withBudget);
+    const method = (
+      init?.method ?? (input instanceof Request ? input.method : "GET")
+    ).toUpperCase();
+    if (method === "POST") {
+      const { pathname } = new URL(url);
+      const facing = CUSTOMER_FACING_PATHS.some((re) => re.test(pathname));
+      const exempt =
+        PRIVATE_CAPABLE_PATH.test(pathname) && isPrivateSend(init?.body);
+      if (facing && !exempt) throw new ChatwootMutedError(`POST ${pathname}`);
+    }
+    return inner(input, withBudget);
+  }) as typeof fetch;
 }
 
 export interface ChatwootClientDeps {
@@ -213,9 +371,33 @@ export class ChatwootClient {
     private readonly config: ChatwootClientConfig,
     fetchImpl: typeof fetch,
   ) {
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl =
+      config.mute || config.expiresOn
+        ? mutedFetch(fetchImpl, config.mute === true, config.expiresOn)
+        : fetchImpl;
     const root = config.baseUrl.replace(/\/+$/, "");
     this.accountBase = `${root}/api/v1/accounts/${config.accountId}`;
+  }
+
+  // WHETHER ANYTHING THIS CLIENT DOES CAN REACH THE CUSTOMER. Asked by callers that arm an effect
+  // the transport cannot see — a scheduled reminder is the one that matters: it runs later, through
+  // the inbox's RESPONDER and a client of its own, so a mute here does not reach it (issue #568,
+  // review round 16). Derived from the same field the wrapper reads, rather than passed alongside
+  // it, so the two cannot disagree about the same client.
+  // Asked by a queued write at the last moment before it sends. Absent ⇒ the write proceeds, which
+  // is what every caller with no fence to offer means. A fence that THROWS is not a withdrawal
+  // either: the write goes out, exactly as every other fence in this codebase decides.
+  private async assertStillWanted(
+    stillWanted: (() => Promise<boolean>) | undefined,
+    endpoint: string,
+  ): Promise<void> {
+    if (!stillWanted) return;
+    const wanted = await stillWanted().catch(() => true);
+    if (!wanted) throw new ChatwootCalledOffError(endpoint);
+  }
+
+  get muted(): boolean {
+    return this.config.mute === true;
   }
 
   // A client can legitimately be built with only the admin token (callers that never act as the
@@ -297,8 +479,15 @@ export class ChatwootClient {
   }
 
   // Transfer-with-summary posts the summary as a private note BEFORE the human takes over.
-  sendPrivateNote(conversationId: number, content: string): Promise<unknown> {
-    return this.sendMessage(conversationId, content, { private: true });
+  sendPrivateNote(
+    conversationId: number,
+    content: string,
+    opts: { sendId?: string } = {},
+  ): Promise<unknown> {
+    return this.sendMessage(conversationId, content, {
+      private: true,
+      sendId: opts.sendId,
+    });
   }
 
   // Sends an audio reply as a WhatsApp voice note (multipart; bot token). `is_recorded_audio` makes
@@ -488,6 +677,8 @@ export class ChatwootClient {
   setConversationCustomAttributes(
     conversationId: number,
     attributes: Record<string, unknown>,
+    // The caller's fence, asked INSIDE the queue right before the write. See the note at the call.
+    opts: { stillWanted?: () => Promise<boolean> } = {},
   ): Promise<unknown> {
     return withKeyedQueue(
       this.targetKey("conversation", conversationId),
@@ -503,6 +694,13 @@ export class ChatwootClient {
           "GET",
           `/conversations/${conversationId}`,
         )) as { custom_attributes?: unknown } | null;
+        // THE LAST MOMENT BEFORE THE WRITE, and it is inside the critical section on purpose. The
+        // caller asked its fence before calling this method; between that ask and this line sit the
+        // queue's wait and the GET above, and `/reset` CLEARS a conversation's attributes in that
+        // window — so a call admitted before it would put the old episode's values back (issue #568,
+        // review round 25). Only an explicit `false` stops the write: a fence that could not answer
+        // is not a withdrawal.
+        await this.assertStillWanted(opts.stillWanted, "custom_attributes");
         return this.request(
           this.config.botToken,
           "POST",
@@ -532,10 +730,16 @@ export class ChatwootClient {
     );
   }
 
-  // Conversation labels (admin token — labels are NOT in the bot allowlist). The POST REPLACES the
-  // whole set, so the assign_label native tool reads the current labels first and appends. Shapes
-  // CONFIRMED against the chatwoot-pro fork (2026-06-14): LabelConcern + labels/{index,create}.json
-  // .jbuilder render `json.payload @labels`; create permits `labels: []` and calls `update_labels`.
+  // Conversation labels. The POST REPLACES the whole set, so the set_labels native tool reads the
+  // current labels first and writes the set it derived from them. Shapes CONFIRMED against the
+  // chatwoot-pro fork (2026-06-14):
+  // LabelConcern + labels/{index,create}.json.jbuilder render `json.payload @labels`; create permits
+  // `labels: []` and calls `update_labels`.
+  //
+  // The READ stays on the admin token for the reason `setConversationCustomAttributes` gives below:
+  // `conversations/labels` entered `BOT_ACCESSIBLE_ENDPOINTS` only on 2026-06-05 (upstream #14655,
+  // the same PR that added `conversations#show`), and self-hosted versions are not ours to pick. A
+  // read attributes nothing, so there is nothing to gain by risking the 401 here.
   async getConversationLabels(conversationId: number): Promise<string[]> {
     const res = (await this.request(
       this.config.adminToken,
@@ -548,20 +752,65 @@ export class ChatwootClient {
       : [];
   }
 
-  setConversationLabels(
+  // THE WRITE IS THE PERSONA'S, because Chatwoot names whoever made the request on the activity line
+  // it writes ("Observadora added cancelamento"). With the admin token that line carries the name of
+  // the person whose token provisioned the instance, so an automated verdict is signed by a human and
+  // the team cannot tell one from the other (issue #493). The bot's own token is authorized for this:
+  // `conversations/labels` → index, create is in `BOT_ACCESSIBLE_ENDPOINTS`, and the controller
+  // authorizes against `ConversationPolicy#show?`, which accepts an agent bot. Fenced upstream in
+  // fazer-ai/chatwoot#476.
+  //
+  // `asAdmin` is for an OPERATOR-initiated write, the way it is on assignToAgent and toggleStatus:
+  // /reset peels an episode's labels off because a person asked, and that is the admin's doing.
+  async setConversationLabels(
     conversationId: number,
     labels: string[],
+    opts: { asAdmin?: boolean } = {},
   ): Promise<unknown> {
-    return this.request(
-      this.config.adminToken,
-      "POST",
-      `/conversations/${conversationId}/labels`,
-      { labels },
-    );
+    const path = `/conversations/${conversationId}/labels`;
+    if (opts.asAdmin)
+      return this.request(this.config.adminToken, "POST", path, { labels });
+    // Two situations cannot use the bot's token, and on both the admin token still can. Losing the
+    // attribution is worse than nothing and better than losing the label, which for an observer IS
+    // the product, so the fall back is taken and NAMED — a silent one would be the bug this method
+    // just fixed, reappearing wherever nobody looks.
+    //   - a client built outside a persona has no bot token (`request` refuses it before the call);
+    //   - an instance older than 2026-06-05 has no labels entry in `BOT_ACCESSIBLE_ENDPOINTS` and
+    //     answers `validate_bot_access_token!` with 401 and THIS reason.
+    //
+    // NOT EVERY 401 (issue #493 review, round 1). A revoked or rotated token, and a bot that belongs
+    // to another account, are 401 as well — and falling back on those would hide a broken credential
+    // behind a write that succeeds under a person's name, which is this bug, restored, with nothing
+    // left to notice it. Chatwoot names the three refusals apart, so they are told apart here.
+    try {
+      return await this.request(this.config.botToken, "POST", path, { labels });
+    } catch (err) {
+      const refused =
+        err instanceof ChatwootMissingTokenError ||
+        (err instanceof ChatwootApiError &&
+          err.status === 401 &&
+          err.reason === BOT_ENDPOINT_NOT_AUTHORIZED);
+      if (!refused) throw err;
+      logger.warn(
+        // REDACTED, because `accountBase` is the operator's configured base URL with the trailing
+        // slashes trimmed and nothing else: a URL carrying userinfo keeps it all the way here, and a
+        // log line is not where a credential goes (issue #493 review, round 2). `redactEndpoint`
+        // keeps the scheme and the host, which is what identifies the instance, and drops the rest;
+        // the account is named separately because the path it lived in is gone with them.
+        {
+          err,
+          conversationId,
+          instance: redactEndpoint(this.accountBase),
+          accountId: this.config.accountId,
+        },
+        "chatwoot: the bot could not write the labels, falling back to the admin token — the activity line will name the admin, not the agent",
+      );
+      return this.request(this.config.adminToken, "POST", path, { labels });
+    }
   }
 
   // Contact labels (admin token, same LabelConcern as conversation labels — POST REPLACES the whole
-  // set, so assign_label reads then appends). Shapes CONFIRMED against the chatwoot-pro fork:
+  // set, so set_labels reads then writes the whole set). Shapes CONFIRMED against the chatwoot-pro fork:
   // contacts/labels/{index,create}.json.jbuilder render `json.payload @labels`; LabelsController
   // includes LabelConcern (create → model.update_labels). Route: /contacts/{id}/labels.
   async getContactLabels(contactId: number): Promise<string[]> {
@@ -585,7 +834,7 @@ export class ChatwootClient {
     );
   }
 
-  // Account-level label TITLES (admin token). Surfaced in the assign_label description so the agent
+  // Account-level label TITLES (admin token). Surfaced in the set_labels description so the agent
   // picks an existing tag. Shape confirmed (2026-06-14): GET /labels → { payload: [{ title }] }.
   async listLabels(): Promise<string[]> {
     const res = (await this.request(
@@ -728,6 +977,8 @@ export class ChatwootClient {
   setContactCustomAttributes(
     contactId: number,
     attributes: Record<string, unknown>,
+    // Same fence, same position, same reason as the conversation scope above.
+    opts: { stillWanted?: () => Promise<boolean> } = {},
   ): Promise<unknown> {
     return withKeyedQueue(this.targetKey("contact", contactId), async () => {
       const existing = (await this.request(
@@ -735,6 +986,7 @@ export class ChatwootClient {
         "GET",
         `/contacts/${contactId}`,
       )) as { payload?: { custom_attributes?: unknown } } | null;
+      await this.assertStillWanted(opts.stillWanted, `contacts/${contactId}`);
       return this.request(
         this.config.adminToken,
         "PUT",
@@ -992,10 +1244,63 @@ export class ChatwootClient {
     );
   }
 
+  // THE BOT ACTUALLY ATTACHED TO AN INBOX, as Chatwoot has it (issue #495 review, round 3). Our
+  // `ChatwootAgentBot` row says a bot was created and attached once; it does not say the attachment
+  // still stands. A bot deleted or detached in the Chatwoot UI, or a best-effort reattach that
+  // failed, leaves that row behind — and `reconcileInboxBots` only reports the drift, since it asks
+  // whether the BOT exists rather than whether it is attached. `GET inboxes/:id/agent_bot` is the
+  // one question that answers this, and the fork serves it beside `set_agent_bot`.
+  //
+  // THREE ANSWERS, not two. The view is `json.agent_bot do ... if @agent_bot.present?`, so the body
+  // is `{"agent_bot": {...the bot...}}` when one is attached and `{"agent_bot": {}}` when none is —
+  // the KEY is always there and the emptiness is what carries the answer. A body without it is a
+  // Chatwoot that does not serve this route, or a shape we do not recognise, and that is UNKNOWN:
+  // `undefined`, so a caller cannot mistake "I could not tell" for "there is none". Reading `res.id`
+  // instead would have answered "none" for every attached bot there is.
+  //
+  // A failed request throws, which is the fourth answer and the caller's to catch: here too an
+  // unreadable read must never become a refusal built on a network blip.
+  async inboxAgentBotId(inboxId: number): Promise<number | null | undefined> {
+    const res = await this.request(
+      this.config.adminToken,
+      "GET",
+      `/inboxes/${inboxId}/agent_bot`,
+    );
+    const bag = res as { agent_bot?: unknown } | null;
+    if (!bag || typeof bag !== "object" || !("agent_bot" in bag))
+      return undefined;
+    const bot = bag.agent_bot as { id?: unknown } | null;
+    const id = bot && typeof bot === "object" ? bot.id : undefined;
+    return typeof id === "number" && Number.isFinite(id) ? id : null;
+  }
+
   // Connect (numeric id) or DISCONNECT (null) the bot for an inbox. The fork's `set_agent_bot`
   // destroys the agent_bot_inbox when `agent_bot` is blank — disconnecting stops Chatwoot from
   // delivering that inbox's events to us (so an unbound inbox never leaves conversations stuck
   // `pending` on a bot we ignore).
+  // The fork's second binding (fazer-ai/chatwoot#453): an OBSERVER receives the inbox's events on
+  // its own route and owns nothing, while `set_agent_bot` below stays the one answering bot. Admin
+  // token — the routes sit beside `set_agent_bot` and are administrator-only. POST is idempotent on
+  // the fork. DELETE answers 404 for an inbox that is gone AND for a bot that was not observing it;
+  // a Chatwoot older than that PR answers 404 to both verbs, and `observeInbox` reads the POST's
+  // 404 as exactly that.
+  addInboxObserver(inboxId: number, agentBotId: number): Promise<unknown> {
+    return this.request(
+      this.config.adminToken,
+      "POST",
+      `/inboxes/${inboxId}/agent_bot_observers`,
+      { agent_bot: agentBotId },
+    );
+  }
+
+  removeInboxObserver(inboxId: number, agentBotId: number): Promise<unknown> {
+    return this.request(
+      this.config.adminToken,
+      "DELETE",
+      `/inboxes/${inboxId}/agent_bot_observers/${agentBotId}`,
+    );
+  }
+
   setInboxAgentBot(
     inboxId: number,
     agentBotId: number | null,
@@ -1259,7 +1564,7 @@ export class ChatwootClient {
 
   // Kanban task labels (admin token). The fork's tasks#update accepts `task: { labels: [...] }` and
   // calls update_labels, which REPLACES the whole set (same acts_as_taggable as conversation/contact),
-  // so assign_label reads the current set (from the card snapshot) then appends. Shape CONFIRMED
+  // so set_labels reads the current set (from the card snapshot) and writes the whole one. Shape CONFIRMED
   // against the chatwoot-pro `feat-kanban-task-labels` branch (tasks_controller#update_task_labels;
   // _task.json.jbuilder renders `json.labels task.cached_label_list_array`).
   setKanbanTaskLabels(taskId: number, labels: string[]): Promise<unknown> {

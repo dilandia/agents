@@ -1,17 +1,18 @@
 import { z } from "zod";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { NATIVE_TOOL_NAMES } from "@/graph/tools/catalog";
-// NOTE: The caps are IMPORTED, never retyped. They go in `.describe()` and never into the schema
-// itself — the rule the file's header states is type and choice, never size, because these are
-// refused by assertSettingsTextSizes on the write rather than clamped by the reader. A caller has to
-// be able to build a valid call from tools/list without failing first (docs/mcp.md), and a number
-// copied here would be a second copy that drifts.
 import {
   CUSTOM_POLICY_MAX,
   GENERATION_PROMPT_MAX,
   TEMPLATE_MESSAGE_MAX,
   TOOL_INSTRUCTIONS_MAX,
 } from "@/modules/agents/text-caps";
+// NOTE: The caps are IMPORTED, never retyped. They go in `.describe()` and never into the schema
+// itself — the rule the file's header states is type and choice, never size, because these are
+// refused by assertSettingsTextSizes on the write rather than clamped by the reader. A caller has to
+// be able to build a valid call from tools/list without failing first (docs/mcp.md), and a number
+// copied here would be a second copy that drifts.
+import { PROTECTED_LABELS_MAX } from "@/modules/agents/tool-guidance";
 import { REDIRECT_DELAY_UNITS } from "@/modules/channel-redirect/service";
 import {
   FULL_DETAIL_MAX_HOURS,
@@ -20,6 +21,11 @@ import {
 import { FOLLOW_UP_DELAY_UNITS } from "@/modules/followups/settings";
 import { GUARDRAIL_ACTIONS } from "@/modules/guardrails/settings";
 import { HANDOFF_MODES } from "@/modules/handoff/settings";
+import {
+  SIGNATURE_FREQUENCIES,
+  SIGNATURE_POSITIONS,
+  SIGNATURE_SEPARATORS,
+} from "@/modules/signature/domains";
 import { STT_PROVIDER_NAMES } from "@/modules/stt/providers";
 import { LANG_RE } from "@/modules/stt/settings";
 import { TTS_PROVIDER_NAMES } from "@/modules/tts/providers";
@@ -177,8 +183,11 @@ const vision = z.looseObject({
   model: modelId(),
   credentialRef: credentialRef(),
   baseURL: baseURL(),
+  // Nullable because the reader honours null as "the default prompt" and the console sends exactly that
+  // on every Behavior save; this schema's rule is that a value the reader honours must parse (#622).
   extractionPrompt: z
     .string()
+    .nullable()
     .optional()
     .describe("what the vision model is asked to extract"),
 });
@@ -190,6 +199,23 @@ const split = z.looseObject({
   minDelayMs: z.number().optional().describe("0-10000, clamped"),
   maxDelayMs: z.number().optional().describe("0-30000, clamped"),
   maxChunks: z.number().optional().describe("1-12, clamped"),
+});
+
+const signature = z.looseObject({
+  enabled: z
+    .boolean()
+    .optional()
+    .describe("off by default; off keeps the text"),
+  text: z.string().optional().describe("the operator's closing line"),
+  position: z.enum(SIGNATURE_POSITIONS).optional().describe("default top"),
+  frequency: z
+    .enum(SIGNATURE_FREQUENCIES)
+    .optional()
+    .describe("which messages of a split reply; default from position"),
+  separator: z
+    .enum(SIGNATURE_SEPARATORS)
+    .optional()
+    .describe("blank = 2 newlines; -- adds a -- line. Chatwoot's own bytes"),
 });
 
 const serviceWindow = z.looseObject({
@@ -688,6 +714,23 @@ const nativeToolKeys = <T extends z.ZodTypeAny>(value: T) => {
   );
 };
 
+// The `set_labels` guard. A block of its own rather than a key beside the taxonomy, because
+// `settings.labels` is now REFUSED on the write (it was retired with the taxonomy, issue #568) and
+// because what this list does is fence a tool, not describe a vocabulary. Loose like its siblings,
+// so a field added to the reader later still reaches it.
+const setLabels = z
+  .looseObject({
+    protected: z
+      .array(z.string())
+      .describe(
+        `labels set_labels may neither add nor remove, and never sees — for the ones another system owns (a switch that keeps an agent off a conversation, a testing marker). Blank, duplicate and non-string entries are dropped by the reader, and the list is capped at ${PROTECTED_LABELS_MAX}. An empty array clears the guard.`,
+      )
+      .optional(),
+  })
+  .describe(
+    "per-agent configuration for the set_labels native tool that is not a note (the note lives in toolGuidance.set_labels)",
+  );
+
 const toolGuidance = nativeToolKeys(toolNote().nullable()).describe(
   `per-native-tool guidance appended to that tool's description; null clears one. A key outside the catalog is dropped by the reader, so only the names published here take effect. Each note is refused above ${TOOL_INSTRUCTIONS_MAX} characters, not trimmed. PRECEDENCE: handoff_to_human and kanban_move_card also have a note in their own block (handoff.instructions, kanban.instructions); a non-empty value THERE wins over this map for that tool, so the value here applies only while the grouped one is empty.`,
 );
@@ -729,12 +772,40 @@ const toolPreconditions = nativeToolKeys(
   "per-native-tool precondition, checked by the runtime BEFORE the call runs (send `null` for a tool to remove its rule): `key` is the custom-attribute key that must be set on the chosen `scope`, and `equals` is the required value (omit it to require any non-blank value). Unmet, the tool does not run and the model is told why. Only native tools can be guarded (issue #389 tracks the rest).",
 );
 
+// What a monitoring agent does with what it reads (issue #477). Descriptions kept to the bone: the
+// MCP schema ceiling (tests/modules/mcp-tool-descriptions.test.ts) is a ratchet, and the reader has
+// docs/chatwoot.md for the rest. The label groups that used to live here are gone with the
+// classifier (issue #568): a watcher labels with `set_labels` like any other agent.
+const monitoring = z.looseObject({
+  analysis: oneOf(["incremental", "on_resolve"] as const)
+    .optional()
+    .describe(
+      "per burst + on resolve, or on resolve only; default incremental",
+    ),
+  window: z
+    .looseObject({ messages: z.number().optional() })
+    .optional()
+    .describe(
+      "newest messages the model reads; 4-60, rounded and clamped, default 20",
+    ),
+  debounce: z
+    .looseObject({
+      windowSeconds: z.number().optional(),
+      maxWindowSeconds: z.number().optional(),
+    })
+    .optional()
+    .describe(
+      "burst window; 3-600s, rounded and clamped, default 20s with a 60s ceiling from the START of the burst",
+    ),
+});
+
 export const BEHAVIOR_PATCH_SHAPE = {
   debounce: debounce.optional(),
   stt: stt.optional(),
   tts: tts.optional(),
   vision: vision.optional(),
   split: split.optional(),
+  signature: signature.optional(),
   serviceWindow: serviceWindow.optional(),
   grounding: grounding.optional(),
   followUp: followUp.optional(),
@@ -752,7 +823,9 @@ export const BEHAVIOR_PATCH_SHAPE = {
   guardrails: guardrails.optional(),
   kanban: kanban.optional(),
   toolGuidance: toolGuidance.optional(),
+  setLabels: setLabels.optional(),
   toolPreconditions: toolPreconditions.optional(),
+  monitoring: monitoring.optional(),
 } satisfies z.ZodRawShape;
 
 export type BehaviorPatchArgs = z.infer<

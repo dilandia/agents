@@ -136,6 +136,19 @@ const MESSAGE_BODY_EVENTS = new Set(["message_created", "message_updated"]);
 // which is why the two questions have one answer.
 export const TURN_BEARING_EVENT = "message_created";
 
+// THE OTHER EVENT THAT CAN OWE ONE, and only in one shape (issue #478). Our own STT write-back
+// PATCHes the attachment and the fork re-dispatches the message as `message_updated`, so the vast
+// majority of these owe nothing — which is the sentence above, and it stays true. What changed is
+// that on a route where nothing ran the turn at creation (the audio was not audible yet, an observer
+// with no responder beside it), the transcription arriving on the UPDATE is the only readable form
+// the customer's message ever takes: there is no later `message_created` to carry it.
+//
+// Named rather than inlined because a ledger row cannot re-derive it: the payload is not stored
+// (issue #228), so `message_updated` alone cannot say which of the two stories a row is. The
+// receiver states it by writing `inboundMessageId`, which no build has ever written for this event
+// otherwise — that pair is the discriminator, and ./stranded-delivery.ts reads it as one.
+export const LATE_TRANSCRIPTION_EVENT = "message_updated";
+
 export function normalizeChatwootEvent(
   payload: unknown,
 ): NormalizedChatwootEvent | null {
@@ -226,6 +239,9 @@ export function normalizeChatwootEvent(
       // The content is the emoji; in_reply_to points at the message it reacts to.
       isReaction: ca?.is_reaction === true,
       externalSenderName: ca ? str(ca.external_sender_name) : null,
+      // NOTE: The Subject header of an inbound email (issue #598). Read through the shared reader so
+      // the delivered event and the REST page cannot disagree about what the subject is.
+      emailSubject: emailSubjectFrom(ca),
       imported: ca?.imported === true,
     };
   }
@@ -312,6 +328,13 @@ export interface LiveConversationState {
   // that wrote newer state without it would leave the row ahead of its own marks, and the next
   // delayed conversation event would look newer than them. null on a Chatwoot too old to send it.
   updatedAt: number | null;
+  // NOTE: WHICH INBOX THE SOURCE SAYS THIS CONVERSATION IS ON (issue #495 review, round 6). A
+  // transfer in Chatwoot reaches the mirror by webhook, so between the move and that delivery the
+  // local row still names the inbox the conversation LEFT — and a rule read off the old inbox's
+  // responder authorises a hand-back into an inbox that may have none. The REST show and every
+  // conversation webhook render `inbox_id` at the top level. null when the payload omits it, which
+  // is the only shape a reader may fall back to the mirror on.
+  inboxId: number | null;
   // NOTE: The newest message id this payload names — the axis a console write that cannot be
   // versioned is ordered by (issue #469, ./console-write-order.ts). The REST show renders
   // `messages` (the `dashboard_seed_message`: the newest renderable message, seeded as the
@@ -345,6 +368,7 @@ export function parseLiveConversation(
     assigneeId,
     assigneeName: assignee ? str(assignee.name) : null,
     lastActivityAt: activitySec !== null ? new Date(activitySec * 1000) : null,
+    inboxId: num(raw.inbox_id),
     updatedAt: num(raw.updated_at),
     latestMessageId: latestMessageId(raw),
   };
@@ -479,6 +503,27 @@ export function isIncomingMessage(e: NormalizedChatwootEvent): boolean {
 // it before the single `save!`), so gating on message_created loses nothing.
 export function isNewIncomingMessage(e: NormalizedChatwootEvent): boolean {
   return e.event === TURN_BEARING_EVENT && isIncomingMessage(e);
+}
+
+// THE WRITE-BACK UPDATE, and what it is worth. When our transcription lands on the attachment the
+// fork re-fires `message_updated`, and ../chatwoot/webhook.ts's `hasPendingInboundMediaUpdate` calls
+// that a no-op — correctly, because there is nothing left to ANALYSE. It is not a no-op for MEMORY: it is the one event that carries
+// the words for a message no turn is going to answer, and reading them costs nothing, since somebody
+// already paid the provider for them (issue #478).
+//
+// Both places the words can be: on the message, where the eager pass stashes them within the
+// delivery that transcribed, and on the attachment, where the fork serializes them on every later
+// delivery of that message. Either one is the whole transcription.
+export function inboundTranscriptionOnUpdate(
+  n: NormalizedChatwootEvent,
+): string | null {
+  if (n.event !== LATE_TRANSCRIPTION_EVENT || !isIncomingMessage(n))
+    return null;
+  return (
+    n.message?.transcribedText ??
+    firstAudioAttachment(n)?.transcribedText ??
+    null
+  );
 }
 
 // A message the BUSINESS sent to the customer, typed by a HUMAN agent rather than produced by a bot.
@@ -750,12 +795,16 @@ export function firstAudioAttachment(e: NormalizedChatwootEvent): {
 // still carry a usable fallback_title (place name + address). Neither ⇒ null, and the render falls
 // back to the generic attachment marker. Shared by the direct webhook path and the debounce
 // re-fetch (issue #45).
-// THE ONE MAPPING FROM A NORMALIZED EVENT TO WHAT THE AGENT WOULD READ. Two callers ask it and one
-// of them is not running a turn: the spend-ceiling gate has to know whether the message it is about
+// THE ONE MAPPING FROM A NORMALIZED EVENT TO WHAT THE AGENT WOULD READ. Three callers ask it and two
+// of them are not running a turn. The spend-ceiling gate has to know whether the message it is about
 // to refuse would have reached a model at all, and `runAgentTurn` answers `skipped` — before any
 // billed call — for a message that renders to nothing (blank content, an attachment type we do not
-// recognise, a reaction). Asking that there with a second copy of this shape would be a second
-// answer to one question, and the two would drift the first time a marker or a field is added.
+// recognise, a reaction). `ingestUnhandledMessage` has to know what to fold into memory for the
+// message no turn will ever cover: the one that arrived outside business hours, and the one a
+// colleague had already taken. Asking either of those with a second copy of this shape would be a
+// second answer to one question, and the two would drift the first time a marker or a field is
+// added — which is exactly what happened to the email subject (issue #598), read by the renderer,
+// the burst and the gate while the memory fold went on dropping the message whole.
 export function incomingRenderable(
   n: NormalizedChatwootEvent,
 ): RenderableMessage {
@@ -770,7 +819,42 @@ export function incomingRenderable(
     location: firstLocationAttachment(n.message?.attachments),
     inReplyTo: n.message?.inReplyTo,
     isReaction: n.message?.isReaction,
+    emailSubject: n.message?.emailSubject,
   };
+}
+
+// The Subject header the mailbox wrote into `content_attributes.email` (MailboxSanitizer sets
+// `email: processed_mail.serialized_data`, and MailPresenter#serialized_data carries `subject`).
+// Read as a STRING and nothing else: the bag is shared with whatever else writes there, and a value
+// of another shape is somebody's colliding key, not a subject. Shared by both readers of the bag so
+// the REST page and the delivered event cannot disagree about it.
+export function emailSubjectFrom(
+  contentAttributes: Record<string, unknown> | null | undefined,
+): string | null {
+  const email = isRecord(contentAttributes?.email)
+    ? contentAttributes.email
+    : null;
+  const subject = email?.subject;
+  if (typeof subject !== "string") return null;
+  return subject.trim() ? subject : null;
+}
+
+// WHAT KIND OF ACTIVITY THIS ROW DECLARES ITSELF TO BE, from `content_attributes.activity.type`
+// (Chatwoot's `status_change_activity` writes `conversation_status_changed`, and Linear's service
+// writes its own). It is the only structural thing an activity row carries: the label, assignee,
+// team, priority and SLA handlers all pass `activity_message_params(content)` with no bag at all.
+// So a row that declares a type is narration about something ELSE, which is what the observer's
+// label history needs to rule out (issue #642, review round 2) — read as a string and nothing else,
+// like every other key in a bag shared with whatever an operator's automation writes there.
+export function activityTypeFrom(
+  contentAttributes: Record<string, unknown> | null | undefined,
+): string | null {
+  const activity = isRecord(contentAttributes?.activity)
+    ? contentAttributes.activity
+    : null;
+  const type = activity?.type;
+  if (typeof type !== "string") return null;
+  return type.trim() ? type : null;
 }
 
 export function firstLocationAttachment(

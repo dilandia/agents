@@ -1,6 +1,9 @@
 import { readModelFallbackConfig } from "@/graph/fallback-settings";
 import { readLimitsConfig } from "@/modules/agents/limits";
-import { readToolGuidance } from "@/modules/agents/tool-guidance";
+import {
+  readProtectedLabels,
+  readToolGuidance,
+} from "@/modules/agents/tool-guidance";
 import { readToolPreconditions } from "@/modules/agents/tool-preconditions";
 import { readAvailabilityConfig } from "@/modules/availability/away";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
@@ -20,7 +23,9 @@ import {
 import { readSendImageConfig } from "@/modules/images/settings";
 import { readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import { readMonitoringConfig } from "@/modules/observe/settings";
 import { readServiceWindowConfig } from "@/modules/service-window/service";
+import { readSignatureConfig } from "@/modules/signature/service";
 import { readSplitConfig } from "@/modules/split/service";
 import { readSttConfig } from "@/modules/stt/settings";
 import { readTtsConfig } from "@/modules/tts/settings";
@@ -52,6 +57,7 @@ export interface BehaviorSettings {
   tts: ReturnType<typeof readTtsConfig>;
   vision: ReturnType<typeof readVisionConfig>;
   split: ReturnType<typeof readSplitConfig>;
+  signature: ReturnType<typeof readSignatureConfig>;
   serviceWindow: ReturnType<typeof readServiceWindowConfig>;
   grounding: { maxDistance: number | null };
   followUp: ReturnType<typeof readFollowUpConfig>;
@@ -82,7 +88,9 @@ export interface BehaviorSettings {
   // thing from outside.
   kanban: ReturnType<typeof readKanbanConfig>;
   toolGuidance: ReturnType<typeof readToolGuidance>;
+  setLabels: { protected: ReturnType<typeof readProtectedLabels> };
   toolPreconditions: ReturnType<typeof readToolPreconditions>;
+  monitoring: ReturnType<typeof readMonitoringConfig>;
 }
 
 // The keys this surface owns inside the settings bag. Any other key (future/unknown) is preserved
@@ -93,6 +101,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "tts",
   "vision",
   "split",
+  "signature",
   "serviceWindow",
   "grounding",
   "followUp",
@@ -110,7 +119,9 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "modelFallback",
   "kanban",
   "toolGuidance",
+  "setLabels",
   "toolPreconditions",
+  "monitoring",
 ] as const;
 export type BehaviorSettingsKey = (typeof BEHAVIOR_SETTINGS_KEYS)[number];
 
@@ -131,6 +142,7 @@ export function readBehaviorSettings(
     tts: readTtsConfig(settings),
     vision: readVisionConfig(settings),
     split: readSplitConfig(settings),
+    signature: readSignatureConfig(settings),
     serviceWindow: readServiceWindowConfig(settings),
     grounding: readGrounding(settings),
     followUp: readFollowUpConfig(settings),
@@ -148,7 +160,9 @@ export function readBehaviorSettings(
     modelFallback: readModelFallbackConfig(settings),
     kanban: readKanbanConfig(settings),
     toolGuidance: readToolGuidance(settings),
+    setLabels: { protected: readProtectedLabels(settings) },
     toolPreconditions: readToolPreconditions(settings),
+    monitoring: readMonitoringConfig(settings),
   };
 }
 
@@ -160,6 +174,7 @@ export interface BehaviorSettingsPatch {
   tts?: Record<string, unknown>;
   vision?: Record<string, unknown>;
   split?: Record<string, unknown>;
+  signature?: Record<string, unknown>;
   serviceWindow?: Record<string, unknown>;
   grounding?: Record<string, unknown>;
   followUp?: Record<string, unknown>;
@@ -177,7 +192,9 @@ export interface BehaviorSettingsPatch {
   modelFallback?: Record<string, unknown>;
   kanban?: Record<string, unknown>;
   toolGuidance?: Record<string, unknown>;
+  setLabels?: Record<string, unknown>;
   toolPreconditions?: Record<string, unknown>;
+  monitoring?: Record<string, unknown>;
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

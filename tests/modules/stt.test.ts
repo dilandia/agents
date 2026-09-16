@@ -253,6 +253,7 @@ describe.skipIf(!dbUp)("stt", () => {
         messageType: "incoming" as const,
         private: false,
         sendId: null,
+        emailSubject: null,
         attachmentTypes: ["audio"],
         transcribedText: null,
         imageDescription: null,
@@ -260,6 +261,7 @@ describe.skipIf(!dbUp)("stt", () => {
         attachmentName: null,
         inReplyTo: null,
         isReaction: false,
+        activityType: null,
         location: null,
       },
     ];
@@ -310,6 +312,7 @@ describe.skipIf(!dbUp)("stt", () => {
         messageType: "incoming" as const,
         private: false,
         sendId: null,
+        emailSubject: null,
         attachmentTypes: ["audio"],
         transcribedText: null,
         imageDescription: null,
@@ -317,6 +320,7 @@ describe.skipIf(!dbUp)("stt", () => {
         attachmentName: null,
         inReplyTo: null,
         isReaction: false,
+        activityType: null,
         location: null,
       },
     ];

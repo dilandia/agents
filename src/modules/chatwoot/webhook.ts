@@ -21,7 +21,12 @@ import { type RuntimeDeps, runAgentTurn } from "@/graph/runtime";
 import { threadBusyForResetOn, turnOwnsThread } from "@/graph/thread-claim";
 import { AppError, UnauthorizedError } from "@/lib/errors";
 import { withKeyedQueue } from "@/lib/locks";
-import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
+import {
+  asSuperAdminOn,
+  runScopedOn,
+  type ScopedDb,
+  type TenantContext,
+} from "@/lib/tenancy";
 import { ingestsContinuously, isMonitoring } from "@/modules/agents/mode";
 import { agentObservesNow, agentStillSpeaks } from "@/modules/agents/speaks";
 import { shouldRunReset } from "@/modules/agents/test-mode";
@@ -53,7 +58,10 @@ import {
   isRedirectEntryInbox,
   readChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
-import { retireCoveredDeliveries } from "@/modules/chatwoot/delivery-sweep";
+import {
+  recordTurnCoverage,
+  retireCoveredDeliveries,
+} from "@/modules/chatwoot/delivery-sweep";
 import {
   describeClosedGate,
   type GateCloseDetail,
@@ -100,8 +108,11 @@ import { readTakeoverConfig } from "@/modules/handoff/settings";
 import { armCompaction } from "@/modules/memory/compact";
 import { clearContactMemory } from "@/modules/memory/reset";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import { armObserve, observeKeyPrefix } from "@/modules/observe/job";
+import { readMonitoringConfig } from "@/modules/observe/settings";
 import {
   cancelPendingJob,
+  cancelPendingJobsByPrefixUpToMessage,
   retireJobsByDedupeKey,
   revokeJobsByKeyPrefixOn,
 } from "@/modules/scheduler/service";
@@ -122,6 +133,7 @@ import {
 import { hashRouteToken } from "@/modules/webhooks/inbound/route-token";
 import type { ChatwootClient } from "./client";
 import { type CommandRoute, commandRoute } from "./command-route";
+import { resetAckSendId } from "./constants";
 import {
   conversationOwnershipNow,
   openForHumanQueue,
@@ -133,16 +145,17 @@ import {
   loadAgentBot,
   loadChatwootClient,
 } from "./instance";
+import { withConversationLabels } from "./labels";
 import { mirrorChatwootEvent } from "./mirror";
 import {
   type ControlCommand,
   controlCommand,
   effectiveAssignee,
   firstAudioAttachment,
-  firstLocationAttachment,
   firstVisualAttachment,
   type HumanReplyRoute,
   heldByAnotherParty,
+  inboundTranscriptionOnUpdate,
   incomingRenderable,
   isIncomingMessage,
   isNewHumanReplyToCustomer,
@@ -238,6 +251,16 @@ async function inboxAgentRuntime(
   // or one that has not synced. Read here because the takeover's device leg cannot be decided from
   // the payload alone (see providerReservesEchoIds), and this query already reads the row.
   whatsappProvider: string | null;
+  // When THIS binding was made (issue #476 review, round 31). An observer beside a responder stands
+  // down for the responder's own delivery, which only exists when the binding predates the event —
+  // see `responderCoversMessage`. Null on a binding older than the column, read there as older than
+  // any delivery. Selected here because this query already reads the row.
+  responderBoundAt: Date | null;
+  // HOW MANY TIMES WHO ROUTES THIS INBOX HAS CHANGED (issue #540), as this reading found it. It is
+  // meaningless on its own and only ever compared — against the generation the DELIVERY recorded at
+  // receipt — to ask whether this reading describes the world the message arrived in. Carried on the
+  // runtime because the row is already being read here.
+  bindingGeneration: number;
 } | null> {
   if (chatwootInboxId == null) return null;
   return runScopedOn(base, sysCtx(tenantId), async (db) => {
@@ -249,7 +272,13 @@ async function inboxAgentRuntime(
           chatwootInboxId,
         },
       },
-      select: { id: true, agentId: true, provider: true },
+      select: {
+        id: true,
+        agentId: true,
+        provider: true,
+        responderBoundAt: true,
+        bindingGeneration: true,
+      },
     });
     if (!inbox?.agentId) return null;
     const agent = await db.agent.findUnique({
@@ -265,11 +294,73 @@ async function inboxAgentRuntime(
       mode: agent.mode,
       settings: agent.settings,
       whatsappProvider: inbox.provider,
+      responderBoundAt: inbox.responderBoundAt,
+      bindingGeneration: inbox.bindingGeneration,
     };
   });
 }
 
 type InboxRuntime = NonNullable<Awaited<ReturnType<typeof inboxAgentRuntime>>>;
+
+// THE INBOX'S BINDING GENERATION, ON ITS OWN (issue #540). The resolvers above carry it for free
+// when they answer, and this exists for the two moments where nothing answered: the ledger INSERT,
+// which records the world the message arrived in, and a route resolution that resolved no runtime at
+// all — which is precisely the reading window 1 is about.
+//
+// NEVER THROWS. Both callers are past the point where a failure could be retried by anyone: the
+// insert path runs after the 200, and the resolution's own retries are about the runtimes. A read
+// that did not answer is null, which every reader treats as "this row cannot say" — the same word as
+// an inbox we do not mirror and a row an older build wrote.
+// The reading itself, on a client the caller already has open, so it can be taken inside the
+// transaction that writes the ledger row.
+async function inboxBindingGenerationIn(
+  db: ScopedDb,
+  instanceId: bigint,
+  at: { chatwootInboxId: number | null; chatwootConversationId: number | null },
+): Promise<number | null> {
+  // The payload's inbox when it names one, otherwise the conversation's mirrored inbox — the same
+  // fallback every resolver above makes, so the generation and the runtime cannot be read off two
+  // different rows.
+  const where =
+    at.chatwootInboxId != null
+      ? { chatwootInstanceId: instanceId, chatwootInboxId: at.chatwootInboxId }
+      : at.chatwootConversationId != null
+        ? {
+            conversations: {
+              some: {
+                chatwootInstanceId: instanceId,
+                chatwootConversationId: at.chatwootConversationId,
+              },
+            },
+          }
+        : null;
+  if (where === null) return null;
+  const row = await db.inbox.findFirst({
+    where,
+    select: { bindingGeneration: true },
+  });
+  return row?.bindingGeneration ?? null;
+}
+
+async function inboxBindingGenerationAt(
+  tenantId: bigint,
+  instanceId: bigint,
+  at: { chatwootInboxId: number | null; chatwootConversationId: number | null },
+  base: PrismaClient,
+): Promise<number | null> {
+  // IT THROWS, and that is the point (PR review, round 9). This used to log and answer null, and a
+  // null here reads as "the generation cannot say" — which switches the window-1 refusal OFF, lets
+  // the CAS through and settles the delivery PROCESSED with no runtime having looked at it. A
+  // transient database failure would have silently produced the exact loss the refusal exists to
+  // prevent, on the one reading where it is the only thing standing in the way.
+  //
+  // The caller resolves the route inside a retry loop and rethrows when it is spent, which leaves
+  // the row PENDING and unclaimed for the sweep. Null is still a real answer from the query itself:
+  // an inbox this delivery cannot name.
+  return runScopedOn(base, sysCtx(tenantId), (db) =>
+    inboxBindingGenerationIn(db, instanceId, at),
+  );
+}
 
 // The same runtime, resolved through the CONVERSATION's stored inbox when the payload named none.
 // A sparse payload used to leave `rt` null here, which downstream reads as "no agent bound": the
@@ -301,6 +392,8 @@ async function conversationInboxRuntime(
             chatwootInboxId: true,
             provider: true,
             agentId: true,
+            responderBoundAt: true,
+            bindingGeneration: true,
           },
         },
       },
@@ -320,6 +413,611 @@ async function conversationInboxRuntime(
       mode: agent.mode,
       settings: agent.settings,
       whatsappProvider: inbox.provider,
+      responderBoundAt: inbox.responderBoundAt,
+      bindingGeneration: inbox.bindingGeneration,
+    };
+  });
+}
+
+// DOES THE RESPONDER ACTUALLY HAVE A DELIVERY OF THIS MESSAGE? (issue #476 review, round 31.)
+//
+// An observer beside a responder does not fold the message into memory, because the responder's own
+// delivery of the same message does — see `responderRemembers`. That is true only when Chatwoot
+// FANNED the message to the responder, and Chatwoot picks a message's recipients from the bindings
+// that stand when it emits the event. A responder bound after the emission gets no delivery for it,
+// so standing down there omits the message from memory permanently: nothing scans a settled
+// observer row again, and the responder's route never saw it.
+//
+// Three answers, cheapest first, and the two reads happen only in the window that needs them:
+//
+//  1. The binding is older than our receipt of this delivery. Then it stood when Chatwoot emitted,
+//     because emission precedes receipt. Covered, with no read. A NULL `responderBoundAt` — a
+//     binding made before the column existed — is read the same way, which is exactly the behaviour
+//     every such inbox already had.
+//  2. The binding is newer than our receipt, and a sibling delivery on the responder's route is
+//     already in the ledger for this message, AND that sibling did not already run without the
+//     binding. Chatwoot fanned it after all (the two routes race, and this one lost), so it is
+//     covered — direct evidence, not an inference from clocks.
+//  3. The binding is newer and there is no sibling, or the only sibling already ran blind. Nothing
+//     is coming. NOT covered: the observer keeps the message.
+//
+// THE SIBLING'S OWN CLOCK is what makes (2) evidence rather than another inference (issue #476
+// review, round 32). `bindInbox` calls Chatwoot BEFORE it commits `agentId`, so a message arriving
+// inside that window is fanned to a responder route the local mirror does not know yet: that
+// delivery resolves no runtime, answers nothing, remembers nothing, and settles. Counting it here
+// hands the message to a route that already declined it, and neither route answers or remembers —
+// the limbo this whole check exists to prevent, at P1 instead of P2. So the sibling counts only
+// while it can still see the binding: never claimed (`claimedAt` null — it runs after this, and the
+// binding is committed by then), or claimed at or after the moment the binding was made. A sibling
+// claimed BEFORE that ran blind and covers nothing.
+//
+// HOW FAR THE BINDING HAS TO PREDATE THE EVENT for the clocks alone to settle it (issue #476 review,
+// round 45). `responderBoundAt` is stamped by US and `last_activity_at` is stamped by CHATWOOT, on a
+// host whose clock is its own: compared directly, a Chatwoot running ahead makes a binding that came
+// AFTER the event look older than it, and the observer stands down for a sibling that does not
+// exist. No timestamp available here is a lower bound on the emission in our own clock — the receipt
+// is later still — so the only clock-free evidence is the sibling row itself.
+//
+// A margin is what makes the fast path honest rather than removing it: outside this band the answer
+// does not depend on which host is ahead, and inside it the ledger is asked instead. Five minutes is
+// far past the skew a synchronised fleet produces and still covers a host that drifted without NTP;
+// it costs one extra read only for a binding made around the time of the event, which is exactly the
+// window the check exists for.
+const BINDING_CLOCK_SKEW_MS = 5 * 60_000;
+
+// THE CLOCK IS THE EMISSION, NOT THE RECEIPT (issue #476 review, round 36). Chatwoot chose the
+// recipients when it emitted, and a receipt is that moment plus a network hop plus however long the
+// delivery waited — so a binding made anywhere in that stretch read as covering a message it never
+// reached. The payload's own `last_activity_at` is that moment for a `message_created` (the
+// conversation's activity IS this message), and it is read at the START of its second: it is only
+// ever epoch seconds, and rounding early is the direction that errs toward asking for evidence
+// rather than toward assuming coverage. A payload that carries none falls back to the receipt,
+// which is the reading every delivery had before this.
+//
+// What remains is bounded by the sibling check rather than by a clock: erring toward "the binding is
+// newer" costs a duplicate line in the shared thread when the sibling is genuinely still in flight,
+// and erring the other way costs the message. Wrong and visible over quiet and wrong, the rule this
+// whole subsystem is built on.
+async function responderCoversMessage(
+  tenantId: bigint,
+  instanceId: bigint,
+  deliveryRowId: bigint,
+  responderBoundAt: Date | null,
+  responderBotId: number,
+  conversationId: number | null,
+  // WHICH MESSAGE, and on WHICH COLUMN the sibling records it (issue #476 review, round 46). A
+  // customer message is the ledger's `inboundMessageId`; a COLLEAGUE'S REPLY is outgoing, so that
+  // column is null on it by construction and the row names the message through
+  // `humanReplyMessageId` instead. Asked with the inbound column alone, a reply found no sibling
+  // ever — the check returned "not covered" without looking — and both routes appended the same
+  // line to the shared thread, which is the duplication this whole predicate exists to prevent.
+  message: { id: number; column: "inbound" | "humanReply" } | null,
+  // When the source EMITTED this event, from the payload's own clock; null when it carries none.
+  emittedAt: Date | null,
+  base: PrismaClient,
+): Promise<boolean> {
+  if (responderBoundAt === null) return true;
+  // ...and only by a margin the clocks cannot invent (round 45): the two stamps come from different
+  // hosts, so "just before" is not an answer either of them can give.
+  if (
+    emittedAt !== null &&
+    responderBoundAt.getTime() <= emittedAt.getTime() - BINDING_CLOCK_SKEW_MS
+  )
+    return true;
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const self = await db.chatwootWebhookDelivery.findUnique({
+      where: { id: deliveryRowId },
+      select: { receivedAt: true },
+    });
+    // Our own row not being readable is not evidence that the responder is missing the message;
+    // keep the answer this path has always given rather than double what the responder remembers.
+    if (self === null) return true;
+    // The receipt only answers where the payload named no emission of its own — and there it is OUR
+    // clock on both sides, so it needs no margin.
+    if (emittedAt === null && responderBoundAt <= self.receivedAt) return true;
+    // Without both coordinates the sibling cannot be named, and an unnamed sibling is not one that
+    // was found. The binding is newer than the delivery here, so the message is the observer's.
+    if (conversationId === null || message === null) return false;
+    const sibling = await db.chatwootWebhookDelivery.count({
+      where: {
+        chatwootInstanceId: instanceId,
+        conversationId,
+        ...(message.column === "inbound"
+          ? { inboundMessageId: message.id }
+          : { humanReplyMessageId: message.id }),
+        routeAgentBotId: responderBotId,
+        // ONLY A SIBLING THAT CAN STILL SEE THE BINDING. Never claimed, so it runs after this read
+        // with the binding committed; or claimed at or after the binding was made, since
+        // `bindInbox` calls Chatwoot BEFORE it commits `agentId` and a message landing in that gap
+        // reaches a responder route the mirror does not name yet, whose delivery resolves no
+        // runtime, answers nothing and settles. Counting that one hands the message to a route that
+        // already declined it, and neither route answers or remembers.
+        //
+        // THE CLAIM NARROWS THAT GAP AND DOES NOT CLOSE IT (issue #476 review, round 52), because
+        // the route is resolved BEFORE the row is claimed: a sibling that read the inbox before the
+        // commit and claimed after it passes this predicate while the runtime it froze saw no
+        // responder. It is the same missing fact as the other windows this feature names — the
+        // delivery does not record the generation its route resolution read — and closing it is
+        // issue #540's own change, a resolution stamp on the ledger. The two read-only alternatives
+        // were measured and are worse: `routeObserved` is `false` for a route that resolved NOTHING
+        // exactly as it is for the responder's, and comparing the sibling's RECEIPT to the binding
+        // guts the check — the sibling is a fan-out of the same message, so its receipt straddles
+        // the binding just as ours does, and the observer would double-remember every message whose
+        // binding is newer than it, which rounds 31 and 33 exist to prevent. What is left costs an
+        // inbox with an observer and NO responder (with one bound, the sibling resolves the
+        // OUTGOING responder and the message IS handled), a bind concurrent to the millisecond with
+        // an inbound message, and the two fanned deliveries straddling the commit in opposite
+        // directions: one observation tick, and a control command typed in that instant.
+        OR: [{ claimedAt: null }, { claimedAt: { gte: responderBoundAt } }],
+        // NEVER THIS ROW (issue #476 review, round 33). One bot serves every role its agent holds,
+        // so an observer unobserved and bound as the responder makes `responderBotId` equal to the
+        // bot THIS delivery arrived on — and a recovery's own claim stamps `claimedAt` after the
+        // binding. The row would then match itself and prove a responder handled a message no
+        // responder delivery ever carried, closing the recovered row with nothing remembering it.
+        // A sibling is another row by definition.
+        id: { not: deliveryRowId },
+      },
+    });
+    return sibling > 0;
+  });
+}
+
+// WHAT THE RESPONDER'S OWN DELIVERY OF THIS MESSAGE DECIDED (issue #540, window 3).
+//
+// The stand-down above answers WHETHER the responder has this message. What the observer also needs
+// is what that delivery DOES with it, and until now that was answered by reading the responder
+// agent's mode and switch as they stand at the moment the observer asks. The two deliveries are
+// concurrent by construction — one message, two routes — so a switch flipped between them makes the
+// observer stay quiet about a message the responder never folded in (it had gone to test mode, or
+// off), or fold in a second copy of one it did.
+//
+// The sibling row states it, from the runtime ITS claim resolved, and the claim happens long before
+// either delivery finishes. Rows that have not claimed are skipped rather than read as `false`: they
+// say nothing yet, and the caller falls back to the mode reading, which is what every delivery did
+// before this column. That fallback is the window this does not close — narrowed to a sibling still
+// between its insert and its claim, rather than the whole of both deliveries.
+//
+// At most one row can match: Chatwoot fans one delivery per route, and the route is pinned to the
+// responder's bot here. `orderBy` is for determinism if that ever stops being true.
+// THE ROW'S STATUS AS IT STANDS, asked only where a refusal is about to be raised on the strength of
+// it. Null when the row cannot be read, which is not "PENDING" and therefore not a refusal.
+async function deliveryStatusOf(
+  base: PrismaClient,
+  tenantId: bigint,
+  deliveryRowId: bigint,
+): Promise<string | null> {
+  // NOT SWALLOWED (PR review, round 9). Read only where every other condition of the refusal already
+  // holds, so an unreadable status is the last thing between this delivery and a claim that settles
+  // it PROCESSED with no runtime. Answering null there would skip the refusal on a failure — an
+  // unknown state read as a settled one, which is the single inversion this fence cannot afford. The
+  // throw leaves the row PENDING and unclaimed, which is what the refusal itself would have done.
+  const row = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.chatwootWebhookDelivery.findUnique({
+      where: { id: deliveryRowId },
+      select: { status: true },
+    }),
+  );
+  return row?.status ?? null;
+}
+
+async function responderSiblingRemembers(
+  tenantId: bigint,
+  instanceId: bigint,
+  deliveryRowId: bigint,
+  responderBotId: number,
+  conversationId: number | null,
+  message: { id: number; column: "inbound" | "humanReply" } | null,
+  // THE EVENT THIS DELIVERY CARRIES, and the sibling has to be the responder's delivery of the SAME
+  // one (PR review, round 1). One customer message reaches the ledger twice — the `message_created`
+  // and, for a voice note, the `message_updated` that finally carried its transcription — and both
+  // name it through `inboundMessageId` (issue #478). Asked without the event, this query could
+  // answer about the responder's OTHER delivery, and where the mode moved between the two it would
+  // hand back the wrong decision: the observer then repeats a message the responder folded in, or
+  // stays quiet about one it did not.
+  event: string,
+  base: PrismaClient,
+): Promise<boolean | null> {
+  if (conversationId === null || message === null) return null;
+  const sibling = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.chatwootWebhookDelivery.findFirst({
+      where: {
+        chatwootInstanceId: instanceId,
+        conversationId,
+        ...(message.column === "inbound"
+          ? { inboundMessageId: message.id }
+          : { humanReplyMessageId: message.id }),
+        routeAgentBotId: responderBotId,
+        event,
+        // A sibling is another row by definition — the same reason the coverage count says so: one
+        // bot serves every role its agent holds, so this delivery's own row can match the responder
+        // bot after a promotion.
+        id: { not: deliveryRowId },
+      },
+      // ...AND ITS STATUS, because a `true` written by the CLAIM is an intent and not a completion
+      // (PR review, round 15). See the rule below for the one column where that difference decides
+      // anything.
+      select: { routeRemembers: true, status: true },
+      // THE NEWEST SIBLING, whatever it says — INCLUDING null (issue #540, PR review round 6). This
+      // query used to skip rows that had not stated a value, and skipping is what made it answer
+      // about the wrong fan-out: one message can emit several `message_updated` webhooks (a raw
+      // media write followed by the transcription's), each fanned out to responder and observer, and
+      // every one of those rows shares this conversation, message, route and event. With the newest
+      // sibling still unclaimed, the skip walked back to an OLDER update's answer and handed it back
+      // as this fan-out's — so a mode change between the two updates made the observer repeat a
+      // message the responder had folded in, or stay quiet about one it had not.
+      //
+      // Nothing on the row identifies its fan-out, so the honest reading is the latest one: null
+      // from it is "the responder has not decided yet", which is the caller's fallback to the
+      // responder's CURRENT mode — and that mode is what the responder's own claim is about to read
+      // anyway, which makes it the better guess than a settled answer to an older question.
+      orderBy: { id: "desc" },
+    }),
+  );
+  if (sibling === null) return null;
+  if (sibling.routeRemembers !== true) return sibling.routeRemembers;
+  // A `true` THIS ROUTE HAS NOT FINISHED ACTING ON IS AN INTENT (PR review, round 15). The claim
+  // writes it from the runtime it resolved, and the ingestion it promises happens later in that same
+  // execution: a responder switched off in between, and then crashing or failing to enqueue, leaves
+  // a row saying it remembers a message it never folded in. The sweep cannot repair that one — a
+  // takeover recovery does not carry the reply body — so the message is gone from the only memory
+  // holding it, permanently, on the strength of this value.
+  //
+  // Asked ONLY of a colleague's REPLY, and the asymmetry is the whole reason the rule is narrow:
+  //
+  //   * on a reply, being wrong toward INGESTING costs an append the dedup window catches (the
+  //     responder folds replies in as `human_agent`, and `recentAgentMessageIds` is the same set this
+  //     route would write), while being wrong toward standing down costs the message;
+  //   * on an INBOUND message, being wrong toward ingesting can append one the responder's turn is
+  //     about to ANSWER — and a turn-handled id never enters the dedup window, so nothing catches
+  //     that. There the intent is the safer reading and stays authoritative.
+  //
+  // Settled means PROCESSED. A row still PROCESSING has not enqueued yet, and a DEAD one was given
+  // up on, which is the case this exists for.
+  //
+  // ANSWERED `false`, NOT null (PR review, round 17). Null would fall back to the responder's current
+  // mode, and that mode reads "remembers" for exactly the responder this is about — one that was on
+  // when it claimed and is still on now. The sibling crashing a moment later then leaves the reply in
+  // nobody's memory, permanently. `false` says the only thing that is actually known: this sibling has
+  // not folded it in yet. Where it goes on to, the two routes carry the SAME dedupe key
+  // (`ingest:<thread>:<message>`) and the same `recentAgentMessageIds` window, so the cost of being
+  // early is an append that is refused, and the cost of being late is the reply.
+  if (message.column === "humanReply" && sibling.status !== "PROCESSED") {
+    return false;
+  }
+  return true;
+}
+
+// WHETHER A TURN ALREADY COVERED THIS MESSAGE, asked of the ledger instead of inferred from who owns
+// the conversation now (issue #576).
+//
+// The gate that decides continuous ingestion is `(act && consumed) || !act`, and `act` is bot
+// ownership AT THE MOMENT OF THE READ. On a `message_created` that is the right question by accident
+// of timing: the decision to run a turn is taken on that same delivery, so "the bot owns it" and "a
+// turn will cover this" are one fact. On the `message_updated` that finally carries a voice note's
+// transcription they come apart, because the reading is taken after the decision it is asking about,
+// and it comes apart in BOTH directions:
+//
+//   * the write-back lands once the conversation changed hands (resolved, or a colleague took it in
+//     the seconds between our PATCH and the fork's re-dispatch). `!act` reads as "no turn is
+//     coming", and a second copy of what the turn already folded in is appended. The dedup window
+//     does not catch it: that window is written by the ingest job alone, so an id a TURN handled was
+//     never put in it.
+//   * a row stranded while a person held the conversation is replayed half an hour later, by which
+//     time the bot has it back. `act && !consumed` reads as "a turn will cover this", nothing is
+//     appended, and the row closes as recovered with the customer's words in nobody's memory.
+//
+// THE ANSWER IS ON THE CREATION'S ROW, not on this one. One customer message reaches the ledger
+// twice and only the first carries a turn's verdict, so this asks about the MESSAGE and not about
+// the event — which is the one way it differs from `responderSiblingRemembers` above, and the
+// difference is load-bearing: narrowed by event, it would find nothing every time.
+//
+// NOT NARROWED BY ROUTE either. `retireCoveredDeliveries` settles on the wide scope precisely
+// because a turn, a command or a gate answers the MESSAGE whichever route carried it, and the rows
+// it excludes there (an observer's, and one that owes words rather than an answer) are the ones that
+// never state a value here at all.
+//
+// Null is "no row can say", and the caller falls back to the ownership reading every delivery made
+// before this column: no row for the message has settled yet, or every one of them predates this
+// release. It narrows the window rather than closing it, and the residue is the creation's own row
+// dying before it settled — the one case where nothing anywhere recorded what was going to happen.
+async function turnCoveredMessage(
+  tenantId: bigint,
+  instanceId: bigint,
+  deliveryRowId: bigint,
+  conversationId: number | null,
+  messageId: number,
+  base: PrismaClient,
+): Promise<boolean | null> {
+  if (conversationId === null) return null;
+  const sibling = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.chatwootWebhookDelivery.findFirst({
+      where: {
+        chatwootInstanceId: instanceId,
+        conversationId,
+        inboundMessageId: messageId,
+        // A sibling is another row by definition, and this one has not settled anything yet.
+        id: { not: deliveryRowId },
+        // Only a row that STATED something. A null is the absence this function reports as null of
+        // its own, and letting one win the ordering would hide a settled sibling behind a row that
+        // has said nothing.
+        turnCovered: { not: null },
+      },
+      select: { turnCovered: true },
+      // ANY `true` WINS, and receipt order decides nothing (PR review, round 1). Several rows carry
+      // the same message — the two bot routes Chatwoot fans to, plus this message's own creation and
+      // update — and they do not all say the same thing: an observer settles its own row `consumed`
+      // (it answers nobody by design), as does a route that stood down because another bot held the
+      // conversation. Taking the newest row let that `false` land after the responder's `true` and
+      // hide it, on nothing better than which delivery was inserted last, and the message was then
+      // folded in a second time. A message cannot become UNANSWERED once a route has answered it, so
+      // `true` is the fact and `false` is only the absence of one; among rows that all say `false`,
+      // the newest is as good an answer as any.
+      orderBy: [{ turnCovered: "desc" }, { id: "desc" }],
+    }),
+  );
+  return sibling?.turnCovered ?? null;
+}
+
+// THE ROUTE'S AGENT, WHEN IT WATCHES THE INBOX RATHER THAN ANSWERING IT (issue #476). A delivery
+// arrives on one persona's route, and that persona may be bound to the payload's inbox as an
+// OBSERVER (`InboxObserver`, the fork's second binding) instead of as its responder. Then the
+// runtime that reads this delivery is the observer's — its switch, its settings, its memory — and
+// the reply path is nobody's on this route, whatever `Inbox.agentId` says: the responder, if there
+// is one, has its own delivery of the same event on its own route.
+//
+// WHAT MAKES A ROUTE AN OBSERVER'S is first of all the delivery itself: the fork delivers to a
+// bot's route only because that bot is the inbox's responder or one of its observers, so a
+// delivery on a route whose agent is NOT the inbox's responder was attached as an observer, row
+// or no row. The row (`InboxObserver`) is written only once Chatwoot agreed (`observeInbox`), so
+// the fork's first events can arrive before it, and an attach whose answer was lost never writes
+// it at all. Reading the route from the delivery closes both without a second state for the row.
+// What the row still decides is the agent that is NOT in monitoring: a monitoring agent on a
+// route that is not the responder's is an observer by construction (only a monitoring agent can
+// be attached as one); a production agent with a row is an observer whose promotion slipped into
+// the attach window, and its route still answers nothing; a production agent with no row on an
+// inbox it does not answer is a mirror that drifted from Chatwoot, and that route keeps the
+// responder path it had before this issue.
+//
+// Two reads, on the same path as `inboxAgentRuntime` for every message. Null when the route is the
+// responder's own, or drifted as above.
+// THE ROUTE'S AGENT AS A CLASSIFIER, which is a different question from the one above (issue #477
+// review, round 4). `observerRuntimeForRoute` answers "whose REPLY PATH is this route": when the
+// route's own bot still HOLDS the conversation and the inbox has a responder, it deliberately
+// answers null, because the reply is the responder's and reading it as an observer's would leave
+// the customer unanswered. Observation is not a reply path. An agent bound to the inbox as an
+// observer watches every conversation on it, including the ones its bot happens to hold from a
+// life before the rebind — and hung off the reply-route answer it watched none of them, on the
+// burst and on the final verdict alike.
+//
+// So this asks the BINDING and nothing else: a row in `InboxObserver` for this route's agent on
+// this inbox. No assignee, no mode inference, no attach window — a row is the one signal that is
+// true regardless of who holds the conversation, and it is the only one that is (see below).
+async function boundObserverRuntime(
+  tenantId: bigint,
+  instanceId: bigint,
+  routeAgentBotId: number | null,
+  at: { chatwootInboxId: number | null; chatwootConversationId: number | null },
+  base: PrismaClient,
+): Promise<InboxRuntime | null> {
+  if (routeAgentBotId === null) return null;
+  const inbox =
+    at.chatwootInboxId != null
+      ? { chatwootInstanceId: instanceId, chatwootInboxId: at.chatwootInboxId }
+      : at.chatwootConversationId != null
+        ? {
+            conversations: {
+              some: {
+                chatwootInstanceId: instanceId,
+                chatwootConversationId: at.chatwootConversationId,
+              },
+            },
+          }
+        : null;
+  if (inbox === null) return null;
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const bot = await db.chatwootAgentBot.findFirst({
+      where: {
+        chatwootInstanceId: instanceId,
+        chatwootAgentBotId: routeAgentBotId,
+      },
+      select: {
+        agentId: true,
+        agent: { select: { enabled: true, mode: true, settings: true } },
+      },
+    });
+    if (!bot) return null;
+    const row = await db.inbox.findFirst({
+      where: inbox,
+      select: {
+        id: true,
+        chatwootInboxId: true,
+        provider: true,
+        agentId: true,
+        responderBoundAt: true,
+        bindingGeneration: true,
+        observers: {
+          where: { agentId: bot.agentId },
+          // The STAMP as well as the row (issue #540, window 5): a row with none is an attach the
+          // fork has not confirmed, which counts as observing everywhere it gates a refusal and is
+          // reported as the attach window here.
+          select: { id: true, attachedAt: true },
+        },
+      },
+    });
+    // THE ROW, AND ONLY THE ROW — the attach window is NOT inferable here (issue #477 review, round
+    // 15, correcting round 11). Round 11 read "a delivery on this route with no row" as proof that
+    // Chatwoot had just taken the attachment, on the grounds that `unobserveInbox` removes the
+    // binding before deleting the row. That misses how Chatwoot fans events: a bot that still OWNS
+    // an older conversation keeps receiving its events after being detached from the inbox, so
+    // "delivery, no row" is also the ordinary post-detach state — and reading it as an attachment
+    // armed a verdict for an agent nobody observes with, which then retried to DEAD on every
+    // message. The reply-route answer beside this one covers the attach window wherever the
+    // delivery is not explained by ownership, which is where it can be told apart.
+    if (!row || row.observers.length === 0) return null;
+    return {
+      agentId: bot.agentId,
+      inboxId: row.id,
+      chatwootInboxId: row.chatwootInboxId,
+      enabled: bot.agent.enabled,
+      mode: bot.agent.mode,
+      settings: bot.agent.settings,
+      whatsappProvider: row.provider,
+      responderBoundAt: row.responderBoundAt,
+      bindingGeneration: row.bindingGeneration,
+    };
+  });
+}
+
+async function observerRuntimeForRoute(
+  tenantId: bigint,
+  instanceId: bigint,
+  routeAgentBotId: number | null,
+  // The payload's inbox when it names one; otherwise the conversation, whose mirrored row names
+  // the inbox — the same fallback `conversationInboxRuntime` makes for the responder.
+  at: { chatwootInboxId: number | null; chatwootConversationId: number | null },
+  // Who the PAYLOAD says holds the conversation, or null when it says nothing at all (a degraded
+  // event carries no `meta`). When the route's own bot holds it, the route is the assigned bot's
+  // whatever the mode says, and an observer is claimed only by a row — so a payload that is silent
+  // is answered by the mirror below rather than read as "held by nobody".
+  assignee: {
+    type: string | null | undefined;
+    id: number | null | undefined;
+  } | null,
+  // A REPLAY of a delivery the ledger records as an observer's: the role is the one it had when the
+  // message arrived, and the questions below are all about now. Undefined on every live delivery.
+  recordedAsObserver: boolean,
+  base: PrismaClient,
+  // `attaching` says the answer came from the attach window rather than from a row, so a verdict
+  // armed off it can tell "the row has not landed" from "the agent was detached".
+): Promise<(InboxRuntime & { attaching: boolean }) | null> {
+  if (routeAgentBotId === null) return null;
+  const inbox =
+    at.chatwootInboxId != null
+      ? { chatwootInstanceId: instanceId, chatwootInboxId: at.chatwootInboxId }
+      : at.chatwootConversationId != null
+        ? {
+            conversations: {
+              some: {
+                chatwootInstanceId: instanceId,
+                chatwootConversationId: at.chatwootConversationId,
+              },
+            },
+          }
+        : null;
+  if (inbox === null) return null;
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const bot = await db.chatwootAgentBot.findFirst({
+      where: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootAgentBotId: routeAgentBotId,
+      },
+      select: {
+        agentId: true,
+        agent: { select: { enabled: true, mode: true, settings: true } },
+      },
+    });
+    if (!bot) return null;
+    const row = await db.inbox.findFirst({
+      where: { tenantId, ...inbox },
+      select: {
+        id: true,
+        chatwootInboxId: true,
+        provider: true,
+        agentId: true,
+        responderBoundAt: true,
+        bindingGeneration: true,
+        observers: {
+          where: { agentId: bot.agentId },
+          // The STAMP as well as the row (issue #540, window 5): a row with none is an attach the
+          // fork has not confirmed, which counts as observing everywhere it gates a refusal and is
+          // reported as the attach window here.
+          select: { id: true, attachedAt: true },
+        },
+      },
+    });
+    if (!row) return null;
+    if (recordedAsObserver)
+      return {
+        // A REPLAY names a role it already had, so the row is the whole answer: an attach window is
+        // about a binding being written now, and this delivery's was written long ago.
+        attaching: false,
+        agentId: bot.agentId,
+        inboxId: row.id,
+        chatwootInboxId: row.chatwootInboxId,
+        enabled: bot.agent.enabled,
+        mode: bot.agent.mode,
+        settings: bot.agent.settings,
+        whatsappProvider: row.provider,
+        // The INBOX's responder binding, carried on the observer's runtime too: same row, and it is
+        // the observer that asks how old it is (`responderCoversMessage`).
+        responderBoundAt: row.responderBoundAt,
+        bindingGeneration: row.bindingGeneration,
+      };
+    if (row.agentId === bot.agentId) return null;
+    // The mirror answers for a payload that named no assignee: a conversation still assigned to a
+    // bot that USED to answer this inbox is that bot's route, and reading a degraded event as
+    // "nobody holds it" would hand the route to the observer's path and leave the customer
+    // unanswered — the new responder's own route stands down before a conversation another bot
+    // holds. Asked only when the payload is silent, which is also the shape of an unassigned one.
+    const held =
+      assignee ??
+      (at.chatwootConversationId != null
+        ? await db.conversation
+            .findFirst({
+              where: {
+                tenantId,
+                chatwootInstanceId: instanceId,
+                chatwootConversationId: at.chatwootConversationId,
+              },
+              select: { assigneeType: true, assigneeId: true },
+            })
+            .then((c) =>
+              c === null ? null : { type: c.assigneeType, id: c.assigneeId },
+            )
+        : null);
+    // HOLDING IT ENDS THE QUESTION (issue #476 review, rounds 8 and 11), row or no row: the fork
+    // delivers to the conversation's assignee bot too, and an agent that used to answer this inbox
+    // keeps holding what it was assigned — after it becomes the watcher as well. That route is the
+    // assigned bot's, which the delivery path answers with the inbox's CURRENT responder; read as an
+    // observer's it would answer nothing, while the responder's own route stands down before a
+    // conversation another bot holds, and the customer would wait forever.
+    // ...but only where there IS a responder to answer through (round 16). With none bound, standing
+    // down hands the message to nobody: the observer's memory is the only one the inbox has, and the
+    // assigned bot's path would resolve no runtime at all.
+    if (
+      held?.type === "AgentBot" &&
+      held.id === routeAgentBotId &&
+      row.agentId !== null
+    )
+      return null;
+    // The row, or — inside the attach window, before it is written — a monitoring agent on a route
+    // that is not the responder's. THIS is where the attach window can be told from a detach: the
+    // branch above already sent away the delivery a detached bot receives because it still OWNS the
+    // conversation, so what reaches here with no row arrived for the INBOX, which only an
+    // attachment explains (issue #477 review, round 15). Reported, so a verdict armed off it can
+    // tell "the row has not landed yet" from "the agent was detached" — those read identically to
+    // the tick's own binding fence, and completing on the second reading is permanent for a resolve.
+    if (row.observers.length === 0 && !isMonitoring(bot.agent.mode))
+      return null;
+    return {
+      // ...OR A ROW THE FORK HAS NOT CONFIRMED (issue #540, window 5). Until this column the attach
+      // window had no fact of its own: the row was written only after Chatwoot agreed, so inside the
+      // window there was nothing but the MODE to go on — and a promotion committing in that same
+      // window took even that away, leaving the delivery read as the responder's or as nobody's.
+      // The row is now written before the call, so the window states itself.
+      attaching:
+        row.observers.length === 0 ||
+        row.observers.some((o) => o.attachedAt === null),
+      agentId: bot.agentId,
+      inboxId: row.id,
+      chatwootInboxId: row.chatwootInboxId,
+      enabled: bot.agent.enabled,
+      mode: bot.agent.mode,
+      settings: bot.agent.settings,
+      whatsappProvider: row.provider,
+      responderBoundAt: row.responderBoundAt,
+      bindingGeneration: row.bindingGeneration,
     };
   });
 }
@@ -611,11 +1309,17 @@ export async function recordAndProcessChatwootDelivery(
   params: RecordAndProcessChatwootParams,
 ): Promise<"processed" | "skipped"> {
   const base = params.base ?? basePrisma;
-  const { rowId } = await claimDelivery(
+  const { rowId, bindingGeneration: rowGeneration } = await claimDelivery(
     base,
     { tenantId: params.tenantId, instanceId: params.instanceId },
     params.deliveryId,
     ledgerFactsOf(params.normalized, params.agentBotId),
+    // Where to read the world this delivery arrived in — read INSIDE the transaction that writes the
+    // row, so the two commit together (issue #540, PR review round 1).
+    {
+      chatwootInboxId: params.normalized.inboxId ?? null,
+      chatwootConversationId: params.normalized.conversationId,
+    },
   );
   return processChatwootDelivery({
     tenantId: params.tenantId,
@@ -623,6 +1327,11 @@ export async function recordAndProcessChatwootDelivery(
     deliveryRowId: rowId,
     agentBotId: params.agentBotId,
     normalized: params.normalized,
+    // THE ROW'S value, never the reading taken above (issue #540). They differ on exactly one path
+    // and it is the one that matters: a redelivery finds a row written under an EARLIER world, which
+    // is the world its message arrived in, while the fresh reading belongs to this attempt. The
+    // recovery passes the row's value for the same reason, so both callers say the same thing.
+    receiptBindingGeneration: rowGeneration,
     base,
     deps: params.deps,
   });
@@ -655,6 +1364,15 @@ const INGEST_ARM_BACKOFF_MS = 300;
 // The nullable ones, named once so the fill cannot be written against a shorter list than the
 // insert. Spelled out rather than derived from `LedgerFacts`, because `event` is the one field that
 // is never null and must never be filled: a row's event is what it is.
+//
+// `bindingGeneration` is the ONE nullable fact deliberately left out, and leaving it out is what
+// makes it true (issue #540). Every other column here answers about the EVENT, which a redelivery
+// carries unchanged however late it arrives. This one answers about the WORLD, read when the row was
+// first written; a redelivery reads a later world, and filling a legacy null with it would put a
+// present-day binding on a row that arrived under an older one — the single lie the column exists to
+// prevent. A row without it keeps saying it cannot answer, which is correct. It is also the only
+// field of `LedgerFacts` that `ledgerFactsOf` does not produce, for the same reason: it is read from
+// the database, inside the transaction that writes the row, rather than derived from the payload.
 const LEDGER_FILLABLE = [
   "conversationId",
   "inboundMessageId",
@@ -670,12 +1388,72 @@ interface LedgerFacts {
   humanReplyShape: HumanReplyRoute | null;
   routeAgentBotId: number | null;
   humanReplyMessageId: number | null;
+  bindingGeneration: number | null;
+}
+
+// The one late write to `inboundMessageId`, for the delivery whose words this process produced
+// rather than received (issue #478 review, round 3). Guarded on the column still being null, which
+// is the same rule the legacy fill uses and the reason a redelivery cannot move a value.
+//
+// Only for an UPDATE that now carries a transcription. A creation's id was decided at INSERT from
+// what a creation is, and filling one here could only write an id onto a row that was right to have
+// none.
+//
+// RETRIED like the ledger claim itself and against the same failure (issue #478 review, round 6): a
+// pool momentarily full. What this write buys is the ROW'S RECOVERABILITY, so a single attempt made
+// the crash story depend on a blip — the fill misses, the process dies before the arm, and the sweep
+// reads a `message_updated` naming nothing and closes it. Not thrown when the attempts run out: the
+// delivery is still doing its own work, and taking that away would turn a lost recovery into a lost
+// append. Said at `error` instead, because from there the row cannot be replayed.
+export async function fillLedgerTranscribedMessage(
+  tenantId: bigint,
+  deliveryRowId: bigint | null,
+  n: NormalizedChatwootEvent,
+  base: PrismaClient,
+  // Injected by a test, so the retries cost no wall clock. Real callers pass none.
+  sleep?: (ms: number) => Promise<void>,
+): Promise<void> {
+  const messageId = n.message?.id;
+  if (deliveryRowId === null || messageId == null) return;
+  if (inboundTranscriptionOnUpdate(n) === null) return;
+  let lastErr: unknown;
+  const nap = sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  for (let attempt = 1; attempt <= LEDGER_CLAIM_ATTEMPTS; attempt++) {
+    try {
+      await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.chatwootWebhookDelivery.updateMany({
+          where: { id: deliveryRowId, inboundMessageId: null },
+          data: { inboundMessageId: messageId },
+        }),
+      );
+      return;
+    } catch (err) {
+      lastErr = err;
+      logger.warn(
+        "chatwoot: ledger transcription fill attempt %d/%d failed (delivery row %s): %s",
+        attempt,
+        LEDGER_CLAIM_ATTEMPTS,
+        String(deliveryRowId),
+        errMsg(err),
+      );
+      if (attempt < LEDGER_CLAIM_ATTEMPTS) {
+        await nap(LEDGER_CLAIM_BACKOFF_MS * attempt);
+      }
+    }
+  }
+  logger.error(
+    "chatwoot: the ledger could not record the transcribed message %d (delivery row %s) in %d attempts; a process death before the ingestion is armed loses these words with nothing naming them: %s",
+    messageId,
+    String(deliveryRowId),
+    LEDGER_CLAIM_ATTEMPTS,
+    errMsg(lastErr),
+  );
 }
 
 function ledgerFactsOf(
   n: NormalizedChatwootEvent,
   routeAgentBotId: number | null,
-): LedgerFacts {
+): Omit<LedgerFacts, "bindingGeneration"> {
   // Asked ONCE and read twice below, because the two fields it decides are a pair: a row saying a
   // takeover was owed while naming no message for it would leave the recovery's fence blank on the
   // exact rows the fence exists for, and two calls are two chances to diverge.
@@ -683,12 +1461,25 @@ function ledgerFactsOf(
   return {
     event: n.event,
     conversationId: n.conversationId,
-    // Only a NEW INBOUND message, which is the exact set that drives a turn: the sweep uses this to
-    // tell a delivery that lost a customer's message from one that lost nothing (issue #228). The
-    // bot's own reply comes back as a `message_created` too, and an incoming `message_updated` is
-    // usually our own media write-back coming around — neither is a customer waiting for an answer,
-    // so neither may put a row in the loss list.
-    inboundMessageId: isNewIncomingMessage(n) ? (n.message?.id ?? null) : null,
+    // NOTE: Which CUSTOMER MESSAGE this delivery was working, so the sweep can tell a delivery that lost
+    // one from a delivery that lost nothing (issue #228). The bot's own reply comes back as a
+    // `message_created` too, and it is not a customer's, so it stays null.
+    //
+    // AND THE TRANSCRIBED UPDATE, which is the same customer message arriving a second time
+    // (issue #478 review, round 1). Most `message_updated` deliveries are our own media write-back
+    // coming around and still write null here. This one is the write-back that CARRIES THE WORDS,
+    // and on a route where nothing ran the turn at creation it is the message's only readable form —
+    // so a process dying between the claim and the arm loses the transcription with nothing naming
+    // it. Written here, ./stranded-delivery.ts can see that the row owed something.
+    //
+    // The two together are also the DISCRIMINATOR that column has to carry: an id on a
+    // `message_updated` cannot come from an older build, because until this one the condition was
+    // `isNewIncomingMessage` alone and that requires a creation. Every legacy write-back keeps its
+    // null and is closed benign exactly as before.
+    inboundMessageId:
+      isNewIncomingMessage(n) || inboundTranscriptionOnUpdate(n) !== null
+        ? (n.message?.id ?? null)
+        : null,
     // THE OTHER HALF OF THE SAME QUESTION (issue #439): what this delivery OWED. The payload half of
     // the human-reply route, written before anything has read an inbox, so a process that dies in
     // the detached window still leaves behind the fact that a takeover was due. The provider half is
@@ -716,12 +1507,17 @@ async function claimDelivery(
   base: PrismaClient,
   scope: { tenantId: bigint; instanceId: bigint },
   deliveryId: string,
-  facts: LedgerFacts,
-): Promise<{ rowId: bigint; duplicate: boolean }> {
+  facts: Omit<LedgerFacts, "bindingGeneration">,
+  at: { chatwootInboxId: number | null; chatwootConversationId: number | null },
+): Promise<{
+  rowId: bigint;
+  duplicate: boolean;
+  bindingGeneration: number | null;
+}> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= LEDGER_CLAIM_ATTEMPTS; attempt++) {
     try {
-      return await recordDelivery(base, scope, deliveryId, facts);
+      return await recordDelivery(base, scope, deliveryId, facts, at);
     } catch (err) {
       lastErr = err;
       logger.warn(
@@ -747,11 +1543,36 @@ async function recordDelivery(
   base: PrismaClient,
   scope: { tenantId: bigint; instanceId: bigint },
   deliveryId: string,
-  facts: LedgerFacts,
-): Promise<{ rowId: bigint; duplicate: boolean }> {
+  facts: Omit<LedgerFacts, "bindingGeneration">,
+  at: { chatwootInboxId: number | null; chatwootConversationId: number | null },
+): Promise<{
+  rowId: bigint;
+  duplicate: boolean;
+  // THE ROW'S OWN generation, not the caller's reading (issue #540). On a redelivery the row was
+  // written under an earlier world and that is the one the delivery arrived in; the fresh reading
+  // the caller took belongs to this attempt and would date the message to the wrong world. Handed
+  // back from whichever branch answered, so the value the processing uses is always the stored one.
+  bindingGeneration: number | null;
+}> {
   try {
-    const row = await runScopedOn(base, sysCtx(scope.tenantId), (db) =>
-      db.chatwootWebhookDelivery.create({
+    const row = await runScopedOn(base, sysCtx(scope.tenantId), async (db) => {
+      // THE WORLD THIS ROW ARRIVES IN, READ IN THE SAME TRANSACTION THAT WRITES IT (issue #540, PR
+      // review round 1). It used to be one read followed by one insert, and a binding committing
+      // between them put a world on the row that the message never arrived in — the single lie this
+      // column exists to prevent, in the one place it is written.
+      //
+      // AS EARLY AS THIS PATH RUNS, and no earlier. The review asked for the receive path instead;
+      // that path is deliberately read-free (issue #228, measured): the ack waits on the pool it
+      // shares with every turn and compaction in the process, and Chatwoot takes the bot off a
+      // conversation when the ack is slow. What is left uncovered is the hop between the ack and
+      // this task, which is strictly shorter than the hop between Chatwoot emitting the event and
+      // our receiving it — a window no column written on this side can ever cover.
+      const bindingGeneration = await inboxBindingGenerationIn(
+        db,
+        scope.instanceId,
+        at,
+      );
+      return db.chatwootWebhookDelivery.create({
         data: {
           tenantId: scope.tenantId,
           chatwootInstanceId: scope.instanceId,
@@ -763,17 +1584,25 @@ async function recordDelivery(
           // nothing else about the event — the flush re-reads the messages from Chatwoot, so no
           // column here can hold what the customer wrote.
           ...facts,
+          bindingGeneration,
         },
-        select: { id: true },
-      }),
-    );
-    return { rowId: row.id, duplicate: false };
+        select: { id: true, bindingGeneration: true },
+      });
+    });
+    return {
+      rowId: row.id,
+      duplicate: false,
+      bindingGeneration: row.bindingGeneration,
+    };
   } catch (err) {
     if (!isUniqueViolation(err)) throw err;
     const existing = await runScopedOn(base, sysCtx(scope.tenantId), (db) =>
       db.chatwootWebhookDelivery.findFirst({
         where: { chatwootInstanceId: scope.instanceId, deliveryId },
-        select: { id: true },
+        // Read here rather than after the fills below, and it makes no difference which: the fills
+        // deliberately leave `bindingGeneration` alone (see `LEDGER_FILLABLE`), so the stored value
+        // is the same before and after them.
+        select: { id: true, bindingGeneration: true },
       }),
     );
     if (!existing) throw err;
@@ -803,7 +1632,11 @@ async function recordDelivery(
         }),
       );
     }
-    return { rowId: existing.id, duplicate: true };
+    return {
+      rowId: existing.id,
+      duplicate: true,
+      bindingGeneration: existing.bindingGeneration,
+    };
   }
 }
 
@@ -817,6 +1650,19 @@ export interface ProcessChatwootParams {
   // recovery taking back a row the sweep gave up on (issue #295); see the CAS for why it is one
   // statement and not two.
   claimFrom?: "PENDING" | "DEAD";
+  // The role the route had WHEN THE DELIVERY ARRIVED, replayed rather than re-derived (issue #476
+  // review, round 22). Only a recovery passes it, from the ledger's `routeObserved`: bindings move,
+  // and re-deriving would let a delivery that belonged to a watcher be replayed as the responder —
+  // which answers. A live delivery leaves it undefined and the route is read as it always is.
+  routeObserved?: boolean;
+  // THE INBOX'S BINDING GENERATION WHEN THIS DELIVERY WAS RECEIVED (issue #540), as the ledger row
+  // holds it. Both callers pass the ROW's value — the live path from the insert it just made or the
+  // duplicate it found, the recovery from the row it took back — because the question it answers is
+  // about the world the MESSAGE arrived in, and a reading taken now belongs to this attempt.
+  //
+  // Undefined or null is "this row cannot say": a sparse payload, an inbox we do not mirror, a read
+  // that failed, or a row an older build wrote. Never read as generation zero.
+  receiptBindingGeneration?: number | null;
   // What the DIRECT turn did, told to nobody who does not ask. The return union is a contract with
   // every caller (`"processed" | "skipped"`), and widening it would silently change what the live
   // delivery reads; this is opt-in, so only the caller for whom the distinction exists pays for it.
@@ -837,6 +1683,26 @@ export interface ProcessChatwootParams {
   onDirectTurn?: (
     r: { kind: "outcome"; outcome: string } | { kind: "error"; error: unknown },
   ) => void;
+  // WHAT CONTINUOUS INGESTION ANSWERED, for the caller whose whole work IS the ingestion
+  // (issue #478 review, round 7). Called only where the ingestion actually ran, so a caller can tell
+  // "the gate looked at this message and decided" from "no route ever asked" — an inbox unbound,
+  // switched off or flipped to test mode in the half hour a recovery waits reaches neither branch,
+  // and the delivery still returns `"processed"` because nothing failed. A transcription replay that
+  // read that as success would close the row with the words in nobody's memory.
+  //
+  // Opt-in like `onDirectTurn` and for the same reason: the return union is a contract with every
+  // caller, and only the one for whom this distinction exists should pay for it.
+  //
+  // "covered" is not one of the enqueue's own answers: it is a route that ingests standing down on
+  // purpose, because the responder already has the message or is about to consume it as a command
+  // (issue #478 review, round 8). A decision, like the gate's `"nothing"`, and it must not read as
+  // silence — an observer's replay beside a responder reaches it every time, and read as silence the
+  // recovery would put a settled row back on the worklist until it exhausted its attempts.
+  //
+  // "no-reader" is the other decision that is not an enqueue: a switched-on observer on an inbox
+  // with no responder of ours, whose route remembers nothing because nothing would read it (issue
+  // #620).
+  onIngest?: (outcome: IngestOutcome | "covered" | "no-reader") => void;
   base?: PrismaClient;
   // Injectable runtime deps (tests): fake model/client/checkpointer + the contact-auth fetch.
   deps?: RuntimeDeps;
@@ -854,6 +1720,28 @@ function errMsg(err: unknown): string {
 // serialized into webhook payloads (the fork's Attachment#push_event_data exposes no
 // image_description/extracted_text on any file type), so a visual leg here could not tell "never
 // analyzed" from "our own write-back" and would re-run vision on its own write-back event forever.
+// WHETHER A TURN RUNNING ON THIS MESSAGE WOULD HAVE ITS WORDS (issue #576, PR review round 8), which
+// is a narrower question than whether a turn ran over it.
+//
+// A voice note reaches the graph as a placeholder until STT writes back, and a flush armed by an
+// earlier message can legitimately invoke in that window (docs/stt.md, "Known limits"). That turn
+// folded the MESSAGE in and not the WORDS, so recording it as covered suppresses the very ingest the
+// write-back exists to arm — the late transcription is then in nobody's memory, which is the loss
+// this feature is about, reintroduced by its own record.
+//
+// Answered from what the turn's input actually carried: audio with no transcription is a placeholder,
+// and everything else — text, an image, an audio already transcribed — is the message itself.
+//
+// `hasAudio` is the FILE TYPE and never STT eligibility: an attachment whose id or url has not landed
+// yet cannot be transcribed and still reaches the graph as a placeholder, so a predicate that asked
+// "could STT run" would call it a text message and claim its words.
+export function turnHadTheWords(m: {
+  hasAudio: boolean;
+  transcribedText: string | null | undefined;
+}): boolean {
+  return !m.hasAudio || Boolean(m.transcribedText);
+}
+
 export function hasPendingInboundMediaUpdate(
   n: NormalizedChatwootEvent,
 ): boolean {
@@ -922,6 +1810,17 @@ export interface EagerMediaOwner {
   // stays primary, for the reason the command fallback gives: an inbox the payload DID name is an
   // answer, and the stored one may be where the conversation was before this event.
   chatwootInboxId: number | null;
+  // The ledger row this delivery is working, so the row can learn what the pass PRODUCED
+  // (issue #478 review, round 3). `ledgerFactsOf` runs before this and reads the wire: on the update
+  // that brings an audio nobody has transcribed yet, it writes no message id, correctly — there were
+  // no words. The pass then pays a provider for them and stashes them on the event, and from that
+  // instant the delivery owes an append that only this row could name. A death in between leaves a
+  // `message_updated` with a null id, which the sweep closes as carrying nothing.
+  //
+  // Null where the caller has no row to fill — nothing outside `processChatwootDelivery` does.
+  deliveryRowId: bigint | null;
+  // Injected by a test, so the ledger fill's retries cost no wall clock. Real callers pass none.
+  sleep?: (ms: number) => Promise<void>;
 }
 
 // Eager media analysis: transcribe an incoming voice note (STT) and extract an incoming image/document
@@ -984,6 +1883,8 @@ export async function runEagerMedia(
           instanceId,
           chatwootInboxId,
           base,
+          // The route's agent, which on an observer's route is not the inbox's (issue #476 review, round 3).
+          { agentId: owner.agentId },
         );
         if (sttCfg) {
           const text = await transcribeInboundAudio({
@@ -997,7 +1898,19 @@ export async function runEagerMedia(
             base,
             flow: flow(),
           });
-          if (text) n.message.transcribedText = text;
+          if (text) {
+            n.message.transcribedText = text;
+            // NOTE: FILL-ONLY, and immediately: the next statement can throw, and from here on the words
+            // exist nowhere durable but this row. Never an overwrite — a row that already names its
+            // message names the right one, and `ledgerFactsOf` is the only other writer.
+            await fillLedgerTranscribedMessage(
+              tenantId,
+              owner.deliveryRowId,
+              n,
+              base,
+              owner.sleep,
+            );
+          }
         }
       } catch (err) {
         logger.warn("stt failed (conv=%s): %s", convLabel, errMsg(err));
@@ -1014,6 +1927,8 @@ export async function runEagerMedia(
         instanceId,
         chatwootInboxId,
         base,
+        // The route's agent, which on an observer's route is not the inbox's (issue #476 review, round 3).
+        { agentId: owner.agentId },
       );
       if (visionCfg) {
         const extracted = await extractInboundFile({
@@ -1085,6 +2000,9 @@ type IngestOutcome = "queued" | "nothing" | "no-thread" | "failed";
 async function ingestUnhandledMessage(args: {
   tenantId: bigint;
   instanceId: bigint;
+  // THIS DELIVERY'S OWN ROW, so the coverage question below can exclude it from its own answer
+  // (issue #576). Nothing else here needs it.
+  deliveryRowId: bigint;
   n: NormalizedChatwootEvent;
   act: boolean;
   consumed: boolean;
@@ -1140,8 +2058,59 @@ async function ingestUnhandledMessage(args: {
   //    which only the customer spoke (issue #187). BOTH routes a person can answer by: the Chatwoot
   //    composer, and the phone paired to the number the inbox is connected to (issue #430) — the
   //    second was the half #187 could not see, because the fork stores a device reply sender-less.
+  //  - THE SAME CUSTOMER MESSAGE, arriving a second time as the update that finally carries its
+  //    media (issue #478). Some transports emit `message_created` with no attachment and hang the
+  //    voice note on a `message_updated` a moment later: the creation renders to nothing (no text,
+  //    no attachment) and appends nothing, and the update — analysed by the eager pass a few lines
+  //    up, which stashes the transcription ON `n` — was refused here for not being a creation. The
+  //    provider was paid for a transcription that reached no memory at all.
+  //
+  //    TAKEN FROM THE ATTACHMENT TOO, not only from the event: `n.message.transcribedText` is set
+  //    by the eager pass alone, so it is there on the delivery that transcribed — but the fork also
+  //    re-fires the update once our write-back lands, and that second event carries the words in the
+  //    attachment while the message field is still null. Reading both means the words reach memory
+  //    on whichever of the two arrives, including the case where the first one's arm failed.
+  //
+  //    NOT PROTECTED BY THE DEDUP WINDOW, and that is why the gate below is the same one the
+  //    creation used rather than something looser: the window is written by the ingest job alone, so
+  //    a message a TURN answered is absent from it and a second append would stack a duplicate the
+  //    dedup cannot see. What makes that safe is that an answered message needs nothing from here —
+  //    the turn reads the conversation live from Chatwoot when it runs, so it sees the transcription
+  //    by its own route. The gap this closes is the message no turn ever covered.
+  //    AUDIO ONLY, for the reason `hasPendingInboundMediaUpdate` gives: the fork does not serialize
+  //    the vision write-back into webhook payloads, so an image's description exists here only on the
+  //    delivery that produced it — which is a creation, already covered by the clause above. A visual
+  //    leg would be a branch nothing can reach.
+  const lateTranscription = inboundTranscriptionOnUpdate(n);
+  // Hoisted so the renderer below reads it, the same assignment `runEagerMedia` makes at its top for
+  // the same reason: the transcription lives on the attachment, and every reader downstream asks the
+  // message.
+  if (lateTranscription && n.message && !n.message.transcribedText) {
+    n.message.transcribedText = lateTranscription;
+  }
+  const lateMediaAnalyzed = lateTranscription !== null;
+  // WHAT DECIDES THE LATE-TRANSCRIPTION ARM IS THE LEDGER, NOT OWNERSHIP NOW (issue #576). `act` is
+  // read here, on a `message_updated`, about a decision taken on the creation's delivery — so it is
+  // right by accident on a creation and wrong in both directions on an update. `turnCoveredMessage`
+  // asks the creation's own row what actually happened to the message; a null there means no row can
+  // say, and the fallback is the reading every delivery made before this column.
+  //
+  // The creation arm keeps `act`, deliberately. There the two questions ARE the same fact, and the
+  // ledger has nothing to add: the row that would answer is this one, and it has not settled yet.
+  const covered = lateMediaAnalyzed
+    ? await turnCoveredMessage(
+        tenantId,
+        instanceId,
+        args.deliveryRowId,
+        n.conversationId,
+        messageId,
+        base,
+      )
+    : null;
+  const unhandledByOwnership = (act && consumed) || !act;
   const incomingUnhandled =
-    isNewIncomingMessage(n) && ((act && consumed) || !act);
+    (isNewIncomingMessage(n) || lateMediaAnalyzed) &&
+    (covered === null ? unhandledByOwnership : !covered);
   const role: IngestRole | null = incomingUnhandled
     ? "customer"
     : isNewHumanReplyToCustomer(n, {
@@ -1163,17 +2132,14 @@ async function ingestUnhandledMessage(args: {
             .map((a) => a.fileType)
             .filter((t): t is string => t !== null),
         })
-      : renderInboundMessage({
-          text: n.message.content ?? "",
-          transcribedText: n.message.transcribedText,
-          imageDescription: n.message.imageDescription,
-          extractedText: n.message.extractedText,
-          attachmentTypes: (n.message.attachments ?? [])
-            .map((a) => a.fileType)
-            .filter((t): t is string => t !== null),
-          location: firstLocationAttachment(n.message.attachments),
-          inReplyTo: n.message.inReplyTo,
-        });
+      : // ASKED OF `incomingRenderable`, not spelled here (issue #598). This was a second copy of
+        // the shape, and the email subject is what proved the copies drift: the renderer, the burst
+        // and the ceiling gate all learned to read a subject-only email while THIS reader, the one
+        // that folds in the message no turn ever covered, went on dropping it — so the customer who
+        // wrote outside business hours, or to a conversation a colleague had taken, vanished from
+        // the thread and the agent answered in the morning as if nobody had asked anything. One
+        // mapping from a normalized event to what the agent would read, and three callers of it.
+        renderInboundMessage(incomingRenderable(n));
   if (!text.trim()) return "nothing";
   // QUEUED, not appended. The append itself has to be able to say "not now" — a turn owning the
   // channel erases anything written beside it — and an ack we must return in under five seconds is
@@ -1320,6 +2286,19 @@ const CONTACT_AUTH_ERROR_LABELS: Record<string, string> = {
 // anything the customer wrote. This is also the ONE place the endpoint's own reason surfaces: the
 // note sits in the operator's Chatwoot, on the conversation it is about, unlike the execution log
 // that alert channels read.
+// What the CUSTOMER got on this refusal, which the note has to describe correctly. Only a `denied`
+// verdict can send a copy at all: `no_identity` and `error` are silent to the customer by design.
+export type ContactAuthCopyOutcome =
+  // The refusal notice reached the customer.
+  | "sent"
+  // No `denyMessage` configured: the customer got nothing, on purpose.
+  | "none"
+  // Configured, but another refusal on this conversation holds the notice window.
+  | "suppressed"
+  // Configured and attempted, but nothing reached the customer: the send failed, or the
+  // ownership fence stood it down.
+  | "failed";
+
 export function contactAuthNoteText(
   verdict: {
     outcome: ContactAuthOutcome;
@@ -1328,6 +2307,8 @@ export function contactAuthNoteText(
     endpointReason?: string;
   },
   handedOff: boolean,
+  // Defaults to `none` so the sentence stays true for a caller that sends no copy.
+  copy: ContactAuthCopyOutcome = "none",
 ): string {
   const handoffLine = handedOff
     ? " A conversa foi aberta para atendimento humano."
@@ -1341,7 +2322,34 @@ export function contactAuthNoteText(
   if (verdict.outcome === "denied") {
     const motivo = verdict.endpointReason ?? verdict.reason;
     const reason = motivo ? ` Motivo: ${motivo}.` : "";
-    return `🔒 Contato não autorizado pela verificação externa.${reason} O agente não respondeu automaticamente.${handoffLine}`;
+    // The note used to say "O agente não respondeu automaticamente" on every refusal, including the
+    // ones where the deny message HAD just been posted to the customer — a sentence the operator
+    // reads directly below that very message, which makes the note look broken and hides that the
+    // customer already knows.
+    //
+    // The note earns its space by carrying what is NOT on screen. When the copy went out, the
+    // operator can see it: saying so adds nothing, so the note stays quiet about it and keeps only
+    // the reason code, which is the part no one can see. The three cases where NOTHING reached the
+    // customer are the invisible ones, and each is a different thing for the operator to do: nobody
+    // configured a copy, the cooldown withheld it, or the send failed and should be chased.
+    const copyLine = {
+      sent: "",
+      none: " Nenhum aviso foi enviado ao contato: não há mensagem de recusa configurada.",
+      // Says the window was TAKEN, not that a copy landed. A concurrent refusal on the same
+      // conversation claims the copy window BEFORE it sends, so a claim that fails means "another
+      // refusal holds it" — which covers both the one that already spoke and the one still in
+      // flight, and that one may yet fail and give the window back. Whether a copy is on screen is
+      // the operator's to see; what they cannot see is that THIS message produced none, and why.
+      suppressed:
+        " O aviso de recusa não saiu nesta mensagem: a carência entre avisos já estava tomada por outra recusa.",
+      // Says the RESULT, not a cause. This branch is reached both by a send that failed and by the
+      // ownership fence standing the copy down (a human took the conversation, or the agent was
+      // switched off, between the mode read and the refusal): `postPublicMessage` returns the same
+      // false for both, and naming "delivery failure" here would send the operator chasing a
+      // problem that does not exist on the second one.
+      failed: " O aviso de recusa NÃO chegou ao contato.",
+    }[copy];
+    return `🔒 Contato não autorizado pela verificação externa.${reason}${copyLine}${handoffLine}`;
   }
   const cause =
     verdict.status !== undefined
@@ -1701,7 +2709,10 @@ async function maybeConsumeCommandOrGate(params: {
   // (test-mode notice, its reminder, the redirect link, the away message) ask the same question and
   // none of them was asking it. Private notes are deliberately exempt: only the operator sees one, and
   // a note that lands after a handoff explains the silence instead of talking over anybody.
-  const postPublicMessage = async (text: string): Promise<boolean> => {
+  const postPublicMessage = async (
+    text: string,
+    sendId?: string,
+  ): Promise<boolean> => {
     // Inside the try, deliberately: a fence that cannot answer must report "not sent" like any other
     // failure. Thrown, it would skip the away branch's release and burn the day it just claimed on a
     // message the customer never got.
@@ -1731,7 +2742,7 @@ async function maybeConsumeCommandOrGate(params: {
         );
         return false;
       }
-      await client.sendMessage(conversationId, text);
+      await client.sendMessage(conversationId, text, { sendId });
       return true;
     } catch (err) {
       logger.warn(
@@ -1752,9 +2763,12 @@ async function maybeConsumeCommandOrGate(params: {
   // The fallback is a PRIVATE note rather than a bypass: it reaches the operator, stays invisible to
   // the customer, and does not put a bot message into a conversation a human is handling — the same
   // trade the test-mode notice already makes.
-  const postAcknowledgement = async (text: string): Promise<void> => {
-    if (await postPublicMessage(text)) return;
-    await postPrivateNote(text);
+  const postAcknowledgement = async (
+    text: string,
+    sendId?: string,
+  ): Promise<void> => {
+    if (await postPublicMessage(text, sendId)) return;
+    await postPrivateNote(text, sendId);
   };
 
   // Private note (operator-only, invisible to the customer) posted as the persona bot. Used for the
@@ -1763,10 +2777,13 @@ async function maybeConsumeCommandOrGate(params: {
   // per conversation, and a stamp on a note that never arrived spends the only shot the operator gets.
   // The fence does NOT apply here — a note that lands after a handoff explains the silence to whoever
   // took over instead of talking over them.
-  const postPrivateNote = async (text: string): Promise<boolean> => {
+  const postPrivateNote = async (
+    text: string,
+    sendId?: string,
+  ): Promise<boolean> => {
     try {
       const client = await personaClient();
-      await client.sendPrivateNote(conversationId, text);
+      await client.sendPrivateNote(conversationId, text, { sendId });
       return true;
     } catch (err) {
       logger.warn(
@@ -2354,8 +3371,39 @@ async function maybeConsumeCommandOrGate(params: {
       personaClient,
     );
     if (client) {
+      // ...AND THE VERDICTS THAT WOULD PUT THEM BACK (issue #477 review, round 5). A watcher's tick
+      // is armed on a window that outlives this command, and it reads the conversation from Chatwoot
+      // rather than from memory — so a burst armed before the reset wakes up minutes later, reads
+      // the transcript this command did not touch (it clears OUR state, not the customer's
+      // messages), and writes the very labels that were just cleared. Retired by prefix because the
+      // key carries the classifier and a conversation can have two.
+      //
+      // UP TO THE EPISODE BOUNDARY, not everything under the prefix (issue #477 review, round 21).
+      // This step runs late — after the memory clear and a dozen Chatwoot calls — and a customer
+      // message landing in that stretch arrives after the reset and arms a burst that is wanted;
+      // unqualified, this marked it DONE and the new episode's first messages were never classified.
+      // A command that named no message writes no boundary either, and then there is nothing to
+      // order the rows against: the tick's own fence is what stands them down.
+      if (commandMessageId !== null)
+        await step("cancel pending verdicts", "etiquetas", () =>
+          cancelPendingJobsByPrefixUpToMessage(
+            tenantId,
+            "OBSERVE",
+            observeKeyPrefix(
+              chatwootThreadId(tenantId, instanceId, conversationId),
+            ),
+            commandMessageId,
+            base,
+          ),
+        );
       await step("clear labels", "etiquetas", () =>
-        client.setConversationLabels(conversationId, []),
+        // In the conversation's label queue like every other writer, so a clear cannot land in the
+        // middle of somebody's read-modify-write (issue #477 review, round 3).
+        withConversationLabels(params.tenantId, conversationId, () =>
+          // As the ADMIN: /reset is a person peeling the episode's labels off, not the persona
+          // deciding something, and the activity line should say so (issue #493).
+          client.setConversationLabels(conversationId, [], { asAdmin: true }),
+        ),
       );
       await step("clear custom attributes", "atributos", () =>
         client.clearConversationCustomAttributes(conversationId),
@@ -2574,6 +3622,10 @@ async function maybeConsumeCommandOrGate(params: {
       distinctFailed.length === 0
         ? `🔄 Memória, preferência de áudio e etiquetas/atributos desta conversa foram limpos.${heldBack}`
         : `⚠️ Reset parcial: não consegui limpar ${distinctFailed.join(", ")}. O restante foi limpo.${heldBack}`,
+      // NAMED, because this row is where the command's cleanup ends and a later reader has no other
+      // way to find that point: the boundary it holds is the command's own message, and everything
+      // the cleanup wrote sits between the two (constants.ts).
+      commandMessageId === null ? undefined : resetAckSendId(commandMessageId),
     );
     logger.info(
       "chatwoot: /reset (conv=%s failed=%s)",
@@ -3076,11 +4128,20 @@ async function maybeConsumeCommandOrGate(params: {
           const denyMessage =
             verdict.outcome === "denied" ? authCfg.denyMessage : null;
           const copyClaim = denyMessage ? claim("copy") : false;
+          // Tracked so the operator note can say what the CUSTOMER actually got, instead of
+          // claiming silence on top of a refusal that was just delivered.
+          let copyOutcome: ContactAuthCopyOutcome = denyMessage
+            ? copyClaim
+              ? "failed"
+              : "suppressed"
+            : "none";
           if (denyMessage && copyClaim) {
             // The window is claimed before the send, because two settled deliveries racing must not
             // both speak — so a send that does not land has to give it back. Kept, it would silence
             // the next refusal for the whole window over a message the customer never received.
-            if (!(await postPublicMessage(denyMessage))) {
+            if (await postPublicMessage(denyMessage)) {
+              copyOutcome = "sent";
+            } else {
               releaseContactAuthNotice(copyClaim);
             }
           }
@@ -3094,7 +4155,9 @@ async function maybeConsumeCommandOrGate(params: {
           const noteClaim = claim("note");
           if (noteClaim) {
             if (
-              !(await postPrivateNote(contactAuthNoteText(verdict, handedOff)))
+              !(await postPrivateNote(
+                contactAuthNoteText(verdict, handedOff, copyOutcome),
+              ))
             ) {
               releaseContactAuthNotice(noteClaim);
             }
@@ -3154,6 +4217,169 @@ export async function processChatwootDelivery(
 ): Promise<"processed" | "skipped"> {
   const base = params.base ?? basePrisma;
 
+  // RESOLVED BEFORE THE CLAIM (issue #476 review, round 39), which is the whole point: the route's
+  // ROLE is written by the claim itself, in one statement, instead of by an update after it. Written
+  // after, that update is its own failure path — it rejects inside a detached task, long after the
+  // webhook answered 200, and the row it leaves says nothing about its role; the sweep then moves it
+  // to DEAD and the recovery refuses a row whose route bot is not the responder's and that names no
+  // role, so the retry this module promises never runs and the observed message is gone from memory
+  // for good. Claimed and stated together, a row that is PROCESSING has said what it is, and the only
+  // null left is the one an older build wrote.
+  //
+  // The reads this costs are paid before the CAS, so a duplicate delivery that loses the claim pays
+  // for them too. Two scoped reads against a race that is already the uncommon case.
+  const n = params.normalized;
+
+  // Only message_created drives commands, debounce and the agent turn. A message_updated can still
+  // carry an audio attachment that was absent at creation time; it is eligible for STT only.
+  const isNewIncoming = isNewIncomingMessage(n);
+  const hasLateMedia = hasPendingInboundMediaUpdate(n);
+
+  // A human agent's reply is folded into the contact's memory too (ingestUnhandledMessage), and it
+  // ends the agent's attendance on the conversation (the takeover below). The inbox's agent is what
+  // says whether to do either. BOTH routes a person can answer by — see isDeviceAttendantMessage.
+  //
+  // The SUPERSET here, deliberately: the device leg also asks about the inbox's WhatsApp provider,
+  // and that answer lives in the very row this flag decides whether to read.
+  const mayBeHumanReply = mayBeNewHumanReply(n);
+
+  // Resolve the bound agent for a new message (from either side) or a late-media update. The latter
+  // never drives a turn.
+  //
+  // WIDENING THIS IS THE RISKY HALF of issue #187: `rt` turning non-null for a class of event it was
+  // always null for can wake code that was unreachable, not just the code the change is for. Every
+  // other reader of `rt` was checked against an outgoing message and none of them moves — the
+  // eager-media and test-mode gates require isNewIncoming or hasLateMedia, `commandActive` reads a
+  // `command` that is null off anything but a new incoming message, and the channel-redirect
+  // follow-up arm sits inside `if (act && isNewIncoming)`. The only branches this reaches are the
+  // takeover and the ingestion, both at the bottom of this function.
+  //
+  // Issue #430 widened the predicate itself, not this condition: the class of event is the same one
+  // (`message_created`, outgoing, a person wrote it), reached by a second route. The sweep above was
+  // re-run against it and the answer did not change.
+  // ...AND THE WRITE-BACK UPDATE (issue #478), which is the fourth class and the one this predicate
+  // refused for as long as it existed. Without it the transcription of a voice note nobody answers
+  // reaches no memory at all: the creation had no attachment and rendered to nothing, the delivery
+  // that transcribed armed the append, and if that arm failed there was no second chance — and on a
+  // fork that transcribes elsewhere, no first one either.
+  //
+  // THE SWEEP THE PARAGRAPH ABOVE DEMANDS, re-run against this class rather than inherited:
+  //  - `command` is `isNewIncoming ? controlCommand(n) : null`, so every command branch stays inert;
+  //  - the eager-media pass and `activatedTestLateMedia` both require `isNewIncoming || hasLateMedia`,
+  //    so nothing re-analyses and no provider is called twice;
+  //  - the debounce arm, the follow-up cancel and the channel-redirect arm all sit inside
+  //    `isNewIncoming`;
+  //  - the takeover reads `mayBeHumanReply`, which is false on an incoming message;
+  //  - the mirror and the resolve branches never depended on `rt` being null and run either way.
+  // What is left is the ingestion, which is the point.
+  //
+  // AND IT CANNOT DOUBLE-APPEND: `armIngest` keys the job by (thread, message) with `rearm:
+  // "same-work"`, so the write-back's arm and the transcribing delivery's arm are the same row, and
+  // once the job has run the id is in the dedup window and the second verdict is `duplicate`.
+  // NOTE: THE WIRE'S ANSWER, which is the right one for the two decisions made here: whether the event
+  // reaches the runtime at all, and which message the responder-coverage check is about. Both run
+  // before anything has looked at the audio. The eager pass can produce a transcription later, and
+  // the readers that care about THAT ask again below (`carriesTranscription`) — asked once, at the
+  // top, they would stand down on exactly the delivery that paid for the words.
+  const transcriptionOnTheWire = inboundTranscriptionOnUpdate(n) !== null;
+  const wantsRuntime =
+    isNewIncoming || hasLateMedia || mayBeHumanReply || transcriptionOnTheWire;
+  // RETRIED, because this pair now stands BEFORE the claim (issue #476 review, round 44). Moving the
+  // role onto the claim closed the hole where a second write could fail; what it opened is this one:
+  // a transient pool or database error here rejects with the row still PENDING and its role unsaid,
+  // the webhook long since acknowledged, and no caller left to ask again — Chatwoot's own retry is
+  // spent on the ack, not on this task. The sweep does see that row and reports it, so the message is
+  // not lost quietly; it is simply lost, since the recovery refuses a role nothing stated on a route
+  // that is not the responder's. A handful of attempts is what separates "the pool was briefly
+  // exhausted" from that, and it costs nothing on the path that does not fail.
+  //
+  // The same attempts and backoff the ingest arm uses, and the same injected sleep, so a test does
+  // not wait on real time.
+  const resolveRoute = async () => {
+    const responder = wantsRuntime
+      ? n.inboxId != null
+        ? await inboxAgentRuntime(
+            params.tenantId,
+            params.instanceId,
+            n.inboxId,
+            base,
+          )
+        : await conversationInboxRuntime(
+            params.tenantId,
+            params.instanceId,
+            n.conversationId,
+            base,
+          )
+      : null;
+    // The route's own agent when it OBSERVES this inbox (issue #476): on that route the runtime is
+    // the observer's, and the responder — bound or not — is reached by its own delivery. A sparse
+    // payload is answered the way the responder's is, through the conversation's stored inbox.
+    const watcher = wantsRuntime
+      ? await observerRuntimeForRoute(
+          params.tenantId,
+          params.instanceId,
+          params.agentBotId,
+          {
+            chatwootInboxId: n.inboxId,
+            chatwootConversationId: n.conversationId,
+          },
+          // `undefined` is a payload that says NOTHING about the assignee (a degraded event with no
+          // meta); `null` is an explicit unassignment, which is an answer and must not be replaced
+          // by a mirror that has not caught up with it.
+          n.assigneeType === undefined && n.assigneeId === undefined
+            ? null
+            : { type: n.assigneeType, id: n.assigneeId },
+          params.routeObserved === true,
+          base,
+        )
+      : null;
+    // THE GENERATION THIS RESOLUTION READ. Free when either runtime answered — the same row, read in
+    // the same query — and paid for only where neither did, which is the one reading window 1 is
+    // about: a delivery that arrived on a bot route and now resolves nothing at all.
+    const generation = wantsRuntime
+      ? ((watcher ?? responder)?.bindingGeneration ??
+        (await inboxBindingGenerationAt(
+          params.tenantId,
+          params.instanceId,
+          {
+            chatwootInboxId: n.inboxId ?? null,
+            chatwootConversationId: n.conversationId,
+          },
+          base,
+        )))
+      : null;
+    return { responder, watcher, generation };
+  };
+  const routeSleep =
+    params.deps?.sleep ??
+    ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  let resolved: Awaited<ReturnType<typeof resolveRoute>> | null = null;
+  for (let attempt = 1; attempt <= INGEST_ARM_ATTEMPTS; attempt++) {
+    try {
+      resolved = await resolveRoute();
+      break;
+    } catch (err) {
+      logger.warn(
+        "chatwoot: route resolution attempt %d/%d failed (conv=%s): %s",
+        attempt,
+        INGEST_ARM_ATTEMPTS,
+        n.conversationId === null ? "?" : String(n.conversationId),
+        errMsg(err),
+      );
+      // Spent: the row stays PENDING with no role, which is what the sweep reports. Rethrown rather
+      // than swallowed, so the failure is the delivery's and not a runtime silently read as absent.
+      if (attempt === INGEST_ARM_ATTEMPTS) throw err;
+      await routeSleep(INGEST_ARM_BACKOFF_MS * 2 ** (attempt - 1));
+    }
+  }
+  const responderRt = resolved?.responder ?? null;
+  const observer = resolved?.watcher ?? null;
+  const rt = observer ?? responderRt;
+  // Whether the WATCHER answer came from the attach window rather than from a row (round 15). Only
+  // that answer can: the binding read IS the row, and a detached bot still owning an older
+  // conversation keeps receiving its events, so "no row" there is the post-detach state too.
+  const observerAttaching = observer?.attaching === true;
+
   // tx1: CAS <claimFrom>→PROCESSING. A re-entry (duplicate POST that found a stranded PENDING) sees
   // 0 rows and skips.
   //
@@ -3184,63 +4410,140 @@ export async function processChatwootDelivery(
   // was introduced, and the caller bounds a retry on it. A live delivery does not touch it — its
   // claim is not an attempt at recovery, it is the first attempt at all.
   const claimFrom = params.claimFrom ?? "PENDING";
+  // A RECORDED OBSERVER ROLE IS NEVER DOWNGRADED BY ITS OWN REPLAY (issue #476 review, round 53).
+  // The recovery validates the observer's bot before it dispatches, and this resolution runs after
+  // that: a bot reprovisioned or deleted in between leaves `observer` null on a row the ledger says
+  // was a watcher's. Restating the role from THIS reading would write `false` over that `true`, and
+  // the row would then take the inbox's own derivation — on a human-owned conversation, the
+  // responder path settles it PROCESSED without observer ingestion ever running, and the message is
+  // gone from the only memory that was holding it, permanently, because the role that would have
+  // sent it back has been overwritten.
+  //
+  // So the replay does not run at all: no claim, no write, the row stays DEAD on the worklist with
+  // its role and its attempts intact, which is the same answer the recovery gives a delivery naming
+  // a bot nothing carries any more. `ensureAgentBot` provisioning the persona again is what makes it
+  // recoverable; until then the sweep's line is what names it. Reported at `warn` — an `error` here
+  // would page for a bot an operator may have deleted on purpose, and silence would hide the one
+  // case where the row cannot make progress on its own.
+  if (params.routeObserved === true && observer === null) {
+    logger.warn(
+      "chatwoot: a stranded observer delivery names a route that resolves no observer runtime any more (conv=%s, bot=%s); left DEAD rather than replayed as the responder",
+      n.conversationId === null ? "?" : String(n.conversationId),
+      params.agentBotId === null ? "?" : String(params.agentBotId),
+    );
+    return "skipped";
+  }
+  // THE WORLD MOVED UNDER THIS DELIVERY, AND WHAT IT MOVED TO CANNOT ANSWER (issue #540, window 1).
+  //
+  // The route's role is read from the binding as it stands NOW, and an administrative write —
+  // an unobserve, a promotion, an unbind — can land between Chatwoot emitting the event and this
+  // resolution. Where it does, and the reading it leaves resolves NO runtime at all, the delivery
+  // settles PROCESSED having looked at nothing: on an observer-only inbox that is the observer's
+  // memory losing a customer message silently, which is the one outcome this subsystem exists to
+  // make impossible.
+  //
+  // The row records the generation it was RECEIVED under, so this is not a guess about clocks: equal
+  // means nothing about who routes this inbox has moved since the message arrived and the empty
+  // reading is simply the truth (an inbox nothing of ours answers, a bot that still owns an old
+  // conversation); different means the reading describes a world the message never arrived in.
+  //
+  // AND IT REFUSES RATHER THAN RE-RESOLVING, because there is nothing better to resolve to. The role
+  // is a fact about receipt time and both readings available here are about now — re-reading would
+  // only produce a newer wrong answer. So the row is left where it is, PENDING and unclaimed, which
+  // is the state the sweep already reads and reports (./stranded-delivery.ts): a customer message
+  // becomes `lost` and is armed for recovery, a colleague's reply becomes `role-unstated`. By then
+  // the binding has usually settled, and the recovery re-asks every gate against it.
+  //
+  // NOT ON A REPLAY. A recovery arrives with the generation gap already true and by construction
+  // wider, and throwing there would spend the row's attempts re-reporting what the sweep's own line
+  // already says.
+  // NOTE: WHAT THIS ROUTE DOES WITH A MESSAGE IT DOES NOT ANSWER (issue #540, window 3), resolved
+  // here so the claim below can state it. A responder's route folds it into memory while it is
+  // switched on and ingests continuously.
+  //
+  // An observer's route folds it in ONLY FOR A RESPONDER OF OURS BOUND TO THE INBOX (issue #620).
+  // The contact-inbox thread has exactly one kind of reader, a responder's turn, and the observer's
+  // own work is the OBSERVE tick, which reads the conversation from Chatwoot on a throwaway thread
+  // of its own. On an inbox a person or a bot outside this system answers, the append was a job per
+  // message and a compaction per attendance for a memory nobody would open, claimed from the same
+  // lane share the observations wait on. Beside a responder the thread is that responder's, and the
+  // stand-down below decides whether this route fills the message in for it. A responder bound LATER
+  // starts from its binding, and the watermark this route still keeps is what stops it answering the
+  // observed backlog.
+  //
+  // A ROW-BACKED observer decides this whatever its mode says (issue #476 review, round 19): the row
+  // is written without re-asking the mode, and the receiver honours the row over the mode everywhere
+  // else. Only its switch is asked.
+  //
+  // Named here and reused by `routeIngests` far below, so the fact this delivery RECORDS and the
+  // fact it ACTS on cannot drift apart.
+  const routeRemembers =
+    rt === null
+      ? false
+      : rt.enabled &&
+        (observer !== null
+          ? responderRt !== null
+          : ingestsContinuously(rt.mode));
+  const receiptGeneration = params.receiptBindingGeneration ?? null;
+  const resolvedGeneration = resolved?.generation ?? null;
+  if (
+    claimFrom === "PENDING" &&
+    wantsRuntime &&
+    rt === null &&
+    params.agentBotId !== null &&
+    receiptGeneration !== null &&
+    resolvedGeneration !== null &&
+    resolvedGeneration !== receiptGeneration &&
+    // ...AND THE ROW IS STILL THERE TO LEAVE (PR review, round 6). `claimFrom` is what this call
+    // EXPECTS the status to be, not what it is: a repost of an event already settled arrives with
+    // `claimFrom === "PENDING"` all the same, and the CAS below is what turns it into the `skipped`
+    // an idempotent duplicate deserves. Thrown ahead of that CAS, an ordinary duplicate became an
+    // async dispatch failure whose message promised the sweep would pick the row up — and a settled
+    // row is on no sweep worklist, so the promise was false as well as noisy.
+    //
+    // One read, on the refusal path only. A row that settles between this read and the throw costs
+    // a log line and nothing else, which is the same price the race had before the column existed.
+    (await deliveryStatusOf(base, params.tenantId, params.deliveryRowId)) ===
+      "PENDING"
+  ) {
+    throw new Error(
+      `chatwoot: the binding moved between this delivery's receipt (generation ${receiptGeneration}) and its route resolution (generation ${resolvedGeneration}), which now resolves no runtime (conv=${n.conversationId === null ? "?" : String(n.conversationId)}, bot=${params.agentBotId}); leaving the delivery for the sweep rather than settling it against a world it never arrived in`,
+    );
+  }
   const claimed = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
     db.chatwootWebhookDelivery.updateMany({
       where: { id: params.deliveryRowId, status: claimFrom },
       data: {
         status: "PROCESSING",
         claimedAt: new Date(),
+        // The route's role, stated by the claim itself — see the note above the resolution.
+        routeObserved: observer !== null,
+        // ...and what that route DOES with a message it does not answer (issue #540, window 3).
+        // Stated by the same statement and for the same reason: the observer beside this route
+        // stands down on the strength of it, and asking the responder's mode when the question comes
+        // up answers about a switch that may have been flipped since.
+        routeRemembers,
         ...(claimFrom === "DEAD" ? { attempts: { increment: 1 } } : {}),
       },
     }),
   );
   if (claimed.count === 0) return "skipped";
 
-  const n = params.normalized;
-
-  // Only message_created drives commands, debounce and the agent turn. A message_updated can still
-  // carry an audio attachment that was absent at creation time; it is eligible for STT only.
-  const isNewIncoming = isNewIncomingMessage(n);
-  const hasLateMedia = hasPendingInboundMediaUpdate(n);
-
-  // A human agent's reply is folded into the contact's memory too (ingestUnhandledMessage), and it
-  // ends the agent's attendance on the conversation (the takeover below). The inbox's agent is what
-  // says whether to do either. BOTH routes a person can answer by — see isDeviceAttendantMessage.
+  // The route's ROLE was stated by the claim above, and the two being one statement is the point
+  // (issue #476 review, rounds 21, 26 and 39). The recovery of a stranded observer delivery has to
+  // know it was one and nothing after the fact can tell: the observer row follows Chatwoot's
+  // agreement, so a delivery inside the attach window has none, and a binding that moved since
+  // answers about a different moment.
   //
-  // The SUPERSET here, deliberately: the device leg also asks about the inbox's WhatsApp provider,
-  // and that answer lives in the very row this flag decides whether to read.
-  const mayBeHumanReply = mayBeNewHumanReply(n);
-
-  // Resolve the bound agent for a new message (from either side) or a late-media update. The latter
-  // never drives a turn.
-  //
-  // WIDENING THIS IS THE RISKY HALF of issue #187: `rt` turning non-null for a class of event it was
-  // always null for can wake code that was unreachable, not just the code the change is for. Every
-  // other reader of `rt` was checked against an outgoing message and none of them moves — the
-  // eager-media and test-mode gates require isNewIncoming or hasLateMedia, `commandActive` reads a
-  // `command` that is null off anything but a new incoming message, and the channel-redirect
-  // follow-up arm sits inside `if (act && isNewIncoming)`. The only branches this reaches are the
-  // takeover and the ingestion, both at the bottom of this function.
-  //
-  // Issue #430 widened the predicate itself, not this condition: the class of event is the same one
-  // (`message_created`, outgoing, a person wrote it), reached by a second route. The sweep above was
-  // re-run against it and the answer did not change.
-  const wantsRuntime = isNewIncoming || hasLateMedia || mayBeHumanReply;
-  const rt = wantsRuntime
-    ? n.inboxId != null
-      ? await inboxAgentRuntime(
-          params.tenantId,
-          params.instanceId,
-          n.inboxId,
-          base,
-        )
-      : await conversationInboxRuntime(
-          params.tenantId,
-          params.instanceId,
-          n.conversationId,
-          base,
-        )
-    : null;
+  // BOTH ROLES, never best-effort, and never a second statement. Leaving a responder's row null made
+  // the column a two-state answer to a three-state question — null meant "the responder's" and
+  // "nobody decided yet" at once — and a row stranded before the role was stated was replayed as the
+  // responder: on an observer-only inbox that loses the observation silently, on a shared one it
+  // hands the responder a message its own route already answered. A SEPARATE write had the same hole
+  // one step further in: it rejects inside a detached task long after the webhook answered 200, and
+  // the row it leaves says nothing, so the sweep moves it to DEAD and the recovery refuses it —
+  // the promised retry never runs. Claimed and stated together, a row that is PROCESSING has said
+  // what it is, and the only null left is the one an older build wrote.
   const command = isNewIncoming ? controlCommand(n) : null;
   // NOTE: A control command is "active" only for a test-mode agent, and issue #270 is what happens when
   // that question is answered by a different row than the one that acts on it: `rt` resolves the
@@ -3262,8 +4565,15 @@ export async function processChatwootDelivery(
   let commandAgent: { agentId: bigint; inboxId: bigint } | null =
     rt !== null ? { agentId: rt.agentId, inboxId: rt.inboxId } : null;
   if (command !== null) {
-    if (rt !== null) {
-      commandMode = rt.mode;
+    // THE RESPONDER'S MODE decides a command, even on an observer's route (issue #476 review, round
+    // 13): the command is the responder's, and reading the observer's mode here would call an ACTIVE
+    // command inactive — which mirrors it as ordinary customer engagement (the inbound watermark
+    // moves) and writes a dropped-command line about a command that was not dropped.
+    const commandRt =
+      observer !== null && responderRt !== null ? responderRt : rt;
+    if (commandRt !== null) {
+      commandMode = commandRt.mode;
+      commandAgent = { agentId: commandRt.agentId, inboxId: commandRt.inboxId };
     } else if (n.inboxId == null) {
       // NOTE: ONLY when the payload named no inbox at all. An inbox it DID name that resolves to no agent
       // is an answer, not a gap: falling back there would decide the command against whatever inbox
@@ -3283,6 +4593,112 @@ export async function processChatwootDelivery(
     }
   }
   const commandActive = command !== null && commandMode === "test";
+  // HOISTED ABOVE THE MIRROR (issue #476 review, round 38), because the mirror's inbound
+  // watermark depends on the answer: a control command suppresses `lastInboundAt`, and on an
+  // observer's route a command the responder never received is ordinary customer text, whose
+  // timestamp the follow-up episode gate and the 24h service window both read. Left below, the
+  // suppression fired on a command nothing would consume and the mark stayed stale.
+  // ...and only while that responder HAS A ROUTE (issue #476 review, round 4). `responderRt` says
+  // the inbox names an agent, not that the fork can reach it: the persona bot deleted out-of-band
+  // on Chatwoot leaves the binding standing and the route dead, which is the state the console
+  // shows as "missing" with a Reconnect beside it. Standing down for a delivery that never comes
+  // would drop the message from memory entirely. The bot row is the local half of that question
+  // and the one this path can afford to ask; a bot row naming an id Chatwoot no longer has is not
+  // visible from here, and there the responder loses the same message anyway, until Reconnect.
+  const responderBotId =
+    observer !== null && responderRt !== null
+      ? ((
+          await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+            db.chatwootAgentBot.findFirst({
+              where: {
+                tenantId: params.tenantId,
+                chatwootInstanceId: params.instanceId,
+                agentId: responderRt.agentId,
+              },
+              select: { chatwootAgentBotId: true },
+            }),
+          )
+        )?.chatwootAgentBotId ?? null)
+      : null;
+  const responderHasRoute = responderBotId !== null;
+  const watchingBesideResponder =
+    observer !== null && responderRt !== null && responderHasRoute;
+  // ...and only while that responder's route WILL remember, and MAY answer (issue #476 review,
+  // round 1). Its route folds a message in only when the agent is switched on and ingests
+  // continuously (production, or a monitoring agent bound as the responder); a test agent answers
+  // what it is activated for and folds nothing else in, and a switched-off one does nothing until
+  // its switch. Beside those, nobody would remember the message, so this route does. The watermark
+  // follows the answering half instead: a switched-off responder answers nothing until its switch,
+  // and what the observer saw meanwhile is the past by then (the reading #209 gives a flip back to
+  // production), so the mark moves; a test responder may still answer this very message in a
+  // conversation somebody typed /teste into, so the mark stays its own to move. Such a conversation
+  // can then hold an answered message twice (the turn's append and this route's); that is the test
+  // mode's price, bounded to the conversations it was activated for.
+  //
+  // ...and, ABOVE ALL OF THEM, only while that responder ACTUALLY HAS this message (issue #476
+  // review, rounds 31 and 33). Every answer above is about the responder's route as it stands NOW;
+  // whether Chatwoot fanned THIS message to it is a question about the moment of emission, and
+  // `responderCoversMessage` is where it is asked. Asked ONCE, on `watchingBesideResponder` itself,
+  // because EVERY stand-down beside a responder rests on the same premise: the memory below, the
+  // media pass, and the control command. Hung off the memory alone (round 31) it left the other two
+  // standing down for a delivery that does not exist — the audio nobody transcribes, the `/reset`
+  // nobody consumes — which is the same loss by another door. The read is paid only by a delivery on
+  // an observer's route beside a responder with a route, which is the only shape that can use it.
+  // WHICH MESSAGE the sibling would be named by, spelled once because two questions are asked about
+  // it below and answering them against different messages would be a defect nothing else could
+  // catch.
+  const coveredMessage =
+    n.message?.id == null
+      ? null
+      : isNewIncoming || transcriptionOnTheWire || hasLateMedia
+        ? { id: n.message.id, column: "inbound" as const }
+        : mayBeHumanReply
+          ? { id: n.message.id, column: "humanReply" as const }
+          : null;
+  const responderCovers =
+    watchingBesideResponder &&
+    responderBotId !== null &&
+    (await responderCoversMessage(
+      params.tenantId,
+      params.instanceId,
+      params.deliveryRowId,
+      responderRt?.responderBoundAt ?? null,
+      responderBotId,
+      n.conversationId,
+      // A customer message is named by the inbound column; a colleague's reply, which is outgoing,
+      // by the one the takeover recovery reads.
+      // NOTE: AN UPDATE OF A CUSTOMER MESSAGE NAMES THAT SAME MESSAGE (issue #478 review, rounds 1 and 3).
+      // It is not a creation, so without this clause the sibling could not be named and the check
+      // answered "not covered" without looking. Both shapes an update comes in are the same message
+      // by the same customer, and both cost something when the observer does not stand down: the
+      // TRANSCRIBED one ingests a message the responder's own `message_created` delivery already
+      // handled, which the dedup window cannot catch because a turn-handled id never enters it; the
+      // RAW one sends the audio to STT a second time, so the same voice note is paid for twice and
+      // two write-backs race over the same annotation. Same message, same column, same question.
+      coveredMessage,
+      // The START of that second, because the field is only ever epoch seconds and reading it early
+      // errs toward asking the ledger for evidence rather than toward assuming coverage.
+      n.lastActivityAt == null ? null : new Date(n.lastActivityAt * 1000),
+      base,
+    ));
+  // ...AND WHAT THAT SIBLING DOES WITH IT (issue #540, window 3), read here beside the coverage
+  // answer rather than where it is used, so the two questions about one sibling are one pair of
+  // adjacent reads. Asked only where the answer can change anything: with no coverage there is no
+  // stand-down to decide.
+  const siblingRemembers =
+    responderCovers && responderBotId !== null
+      ? await responderSiblingRemembers(
+          params.tenantId,
+          params.instanceId,
+          params.deliveryRowId,
+          responderBotId,
+          n.conversationId,
+          coveredMessage,
+          n.event,
+          base,
+        )
+      : null;
+
   // Mirror metadata (idempotent, monotonic, per-conversation locked) BEFORE the gate so the
   // runtime reads fresh state. Unconditional: applies to every event, not just actionable ones.
   const mirror = await mirrorChatwootEvent(
@@ -3291,7 +4707,12 @@ export async function processChatwootDelivery(
     n,
     base,
     {
-      suppressInboundWatermark: commandActive,
+      // ...but never for a command THIS delivery's route will not consume (round 38). On an
+      // observer's route beside a responder that never received it, the text is an ordinary
+      // customer message here, and suppressing the mark for it leaves the follow-up episode gate
+      // and the 24h service window reading the previous inbound.
+      suppressInboundWatermark:
+        commandActive && (observer === null || responderCovers),
       // Which ladder goes with the episode, if this event turns out to move the pairing. Computed
       // here because the key is this module's to spell, retired in there because it has to be
       // atomic with the write that moves it.
@@ -3448,17 +4869,62 @@ export async function processChatwootDelivery(
     },
     { ourAgentBotId: params.agentBotId },
   );
-  // A MONITORING agent owns the reply path nowhere (issue #209). `act` still says what it always
-  // said — the bot holds the conversation — and that answer keeps its other readers (the takeover,
-  // the settlement scope); what changes is that holding it arms nothing: no gate, no command, no
-  // debounce, no turn. Every message is then one no turn handled, which is the shape ingestion
-  // already folds into memory, and the watermark advances the way it does for a human-owned
-  // conversation, so the day the mode flips to production the backlog observed is not answered.
-  // ENABLED as well (issue #209 review, round 11): a switched-off agent is asked nothing, and
-  // ingestion refuses it, so an agent both off and in monitoring must not take the observer's path
-  // — that path marks the message handled, and nothing would remember it. Off, it takes the path a
-  // switched-off agent takes: no turn loads, and the message waits for the switch, unmarked.
-  const observing = rt?.enabled === true && rt.mode === "monitoring";
+  // A MONITORING agent owns the reply path nowhere (issue #209), and neither does any agent on an
+  // OBSERVER's route (issue #476). `act` still says what it always said — the bot holds the
+  // conversation — and that answer keeps its other readers (the takeover, the settlement scope);
+  // what changes is that holding it arms nothing: no gate, no command, no debounce, no turn. Every
+  // message is then one no turn handled, which is the shape ingestion already folds into memory,
+  // and the watermark advances the way it does for a human-owned conversation, so the day the mode
+  // flips to production the backlog observed is not answered.
+  // ENABLED as well, on the responder's half (issue #209 review, round 11): a switched-off agent is
+  // asked nothing, and ingestion refuses it, so an agent both off and in monitoring must not take
+  // the observer's path — that path marks the message handled, and nothing would remember it. Off,
+  // it takes the path a switched-off agent takes: no turn loads, and the message waits for the
+  // switch, unmarked. An observer's ROUTE stays the observer's whatever its switch says: nothing on
+  // it answers, and the watermark is not this route's to move (`watchingBesideResponder`).
+  const observing =
+    observer !== null || (rt?.enabled === true && rt.mode === "monitoring");
+  // AN OBSERVER BESIDE A RESPONDER OF OURS (issue #476): the responder's own delivery of this
+  // message is the one that answers or deliberately skips it, and the responder's memory is the
+  // one that keeps it. The thread is keyed by contact-inbox, not by agent, so the two routes write
+  // the SAME thread: the responder's turn appends what it answers and its continuous ingestion
+  // folds in what it skips and what a colleague replied. An observer folding the same message in
+  // once more doubled every answered customer message in the checkpoint — the invariant
+  // `graph/runtime.ts` states ("a message a turn answers is never ingested"), broken from a second
+  // route. So beside a responder this route neither moves the watermark (below) nor appends. With
+  // no responder nothing reads that memory, and this route keeps only the watermark
+  // (`routeRemembers`).
+  //
+  // ...AND WHAT IT REMEMBERS IS READ FROM THE SIBLING'S OWN STATEMENT WHERE THERE IS ONE (issue #540,
+  // window 3). The mode reading below is about the responder as it stands NOW, and the two
+  // deliveries are concurrent by construction: a switch flipped between them makes this route stay
+  // quiet about a message the responder never folded in, or fold in a second copy of one it did.
+  // The sibling recorded what its own claim resolved. Null is a sibling that has not claimed yet or
+  // a row an older build wrote, and there the mode reading stands, exactly as it always did.
+  const responderRemembers =
+    responderCovers &&
+    (siblingRemembers ??
+      (responderRt?.enabled === true && ingestsContinuously(responderRt.mode)));
+  // THE MARK STAYS THE RESPONDER'S WHENEVER THERE IS ONE (issue #476 review, round 37), and this is
+  // deliberately NOT asked of `responderCovers`. An absent sibling row is not proof that none is
+  // coming: it is also what a sibling still in transit looks like, and the emission clock is only
+  // second-granular, so a binding made just before the message can read as newer than it. Moving
+  // the mark on that reading puts the message BEHIND the watermark, and the responder's own
+  // delivery — arriving a moment later — is then suppressed and the customer goes unanswered. The
+  // coverage answer is allowed to cost a duplicate line in memory (`responderRemembers` above);
+  // it is not allowed to cost an answer. So the mark is held for the answering half whenever one
+  // exists with a route, exactly as it was before the coverage check existed.
+  //
+  // ...ON THE LIVE PATH. A REPLAY is the other case, and there the absence IS evidence (issue #476
+  // review, round 48): the delivery reaches this function again only after the sweep gave up on it,
+  // which is half an hour of a threshold, so a sibling that was ever coming has long since arrived
+  // and been recorded. Holding the mark there withholds it from a responder bound in the meantime —
+  // which then flushes from a watermark that predates the whole observed backlog and answers, or
+  // duplicates, conversation the watcher already read. On a replay the coverage answer is the
+  // settled one, so it decides the mark too.
+  const responderMayAnswer =
+    (params.claimFrom === "DEAD" ? responderCovers : watchingBesideResponder) &&
+    responderRt?.enabled === true;
   // Set by the direct turn below when it stood down under an agent that observes NOW: the message
   // is then the observer's to remember, not the turn's (issue #209 review, round 6).
   let handedToObserver = false;
@@ -3501,6 +4967,134 @@ export async function processChatwootDelivery(
   //    ANY event carrying a status, not just message_created. `inboxAgentRuntime` is reused (a resolve is
   //    never a message, so not gated on isNewIncoming). Best-effort: a failure must not strand the
   //    delivery. ──
+  // THE WATCHER'S FINAL VERDICT (issue #477), armed off the resolve EVENT on the route it arrives
+  // on, and not off the mirror's transition below. With an observer beside a responder the same
+  // resolve reaches each bot on its own route, and the transition is applied by whichever route
+  // mirrors it first — the other reads a conversation already resolved and would arm nothing. The
+  // row is one per conversation, so the second arm folds into the first; Chatwoot's two resolve
+  // events fold the same way. For the responder when it is the one monitoring, and for the route's
+  // own observer when there is one. Best-effort, like the compaction below.
+  //
+  // ...but only while the conversation IS resolved, which is the mirror's answer and not the
+  // payload's (issue #477 review, round 2). Arming off the event is what lets the second route arm
+  // at all, and it also trusts a payload the mirror REJECTED as out of order: a delayed `resolved`
+  // landing after a newer event reopened the conversation would pull the verdict forward and let an
+  // `on_resolve` agent relabel a live conversation. The mirror's status is the effective one in both
+  // cases — applied by this delivery, or already applied by the other route — so it separates the
+  // second route from a stale event, which `mirror.applied` alone cannot. `effectiveStatus` falls back
+  // to the payload where the mirror read nothing, so a status nothing could store still arms.
+  if (
+    n.conversationId !== null &&
+    n.status === "resolved" &&
+    effectiveStatus === "resolved" &&
+    (n.event === "conversation_status_changed" ||
+      n.event === "conversation_resolved")
+  ) {
+    const conversationId = n.conversationId;
+    // BEST-EFFORT AS A WHOLE (issue #477 review, round 2). The two runtime reads below are database
+    // calls on a delivery that is already CLAIMED, and a status-only event carries no
+    // `inboundMessageId` — so nothing recovers it: the sweep needs a customer message id to anchor
+    // on. A transient pool error thrown from here escaped past the compaction and the redirect
+    // closing that follow, on conversations that have no observer at all. A label that is late is
+    // not a message that is lost; a closing message that never goes out is.
+    try {
+      let closingInboxId = n.inboxId;
+      if (closingInboxId === null) {
+        try {
+          const stored = await runScopedOn(
+            base,
+            sysCtx(params.tenantId),
+            (db) =>
+              db.conversation.findUnique({
+                where: {
+                  tenantId_chatwootInstanceId_chatwootConversationId: {
+                    tenantId: params.tenantId,
+                    chatwootInstanceId: params.instanceId,
+                    chatwootConversationId: conversationId,
+                  },
+                },
+                select: { inbox: { select: { chatwootInboxId: true } } },
+              }),
+          );
+          closingInboxId = stored?.inbox?.chatwootInboxId ?? null;
+        } catch (err) {
+          logger.warn(
+            "chatwoot: resolving the inbox for the observer's final verdict failed (conv=%s): %s",
+            String(conversationId),
+            errMsg(err),
+          );
+        }
+      }
+      const responderRt = await inboxAgentRuntime(
+        params.tenantId,
+        params.instanceId,
+        closingInboxId,
+        base,
+      );
+      const observerRt = await observerRuntimeForRoute(
+        params.tenantId,
+        params.instanceId,
+        params.agentBotId,
+        {
+          chatwootInboxId: closingInboxId,
+          chatwootConversationId: conversationId,
+        },
+        // Same reading of the payload the message path makes: `undefined` on both is a degraded event
+        // that says nothing and is answered by the mirror; `null` is an explicit unassignment.
+        n.assigneeType === undefined && n.assigneeId === undefined
+          ? null
+          : { type: n.assigneeType, id: n.assigneeId },
+        params.routeObserved === true,
+        base,
+      );
+      // ...and the BOUND observer, asked of the binding rather than of the reply route, for the
+      // reason the burst arm names: a watcher whose bot still holds the conversation resolves to no
+      // reply route and would otherwise miss its own final verdict (issue #477 review, round 4).
+      const boundRt = await boundObserverRuntime(
+        params.tenantId,
+        params.instanceId,
+        params.agentBotId,
+        {
+          chatwootInboxId: closingInboxId,
+          chatwootConversationId: conversationId,
+        },
+        base,
+      );
+      const seen = new Set<bigint>();
+      for (const watcher of [responderRt, observerRt, boundRt]) {
+        if (
+          watcher?.enabled &&
+          isMonitoring(watcher.mode) &&
+          !seen.has(watcher.agentId) &&
+          (watcher === responderRt || responderRt?.agentId !== watcher.agentId)
+        ) {
+          seen.add(watcher.agentId);
+          await armObserve({
+            tenantId: params.tenantId,
+            instanceId: params.instanceId,
+            conversationId,
+            agentId: watcher.agentId,
+            reason: "resolved",
+            cfg: readMonitoringConfig(watcher.settings),
+            // The conversation's own version (`updated_at.to_f`) names this RESOLUTION, so the four deliveries one
+            // resolve produces (two event types × two routes) buy one verdict between them.
+            mark: n.conversationUpdatedAt,
+            // Only the REPLY-ROUTE answer can be an attach-window one (round 15), and here it
+            // matters most: the mark above suppresses every later delivery of this resolution, so a
+            // tick that completed on a row that had not landed yet lost the final verdict for good.
+            attaching: watcher === observerRt && observerRt.attaching === true,
+            base,
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        "chatwoot: arming the observer's final verdict failed (conv=%s): %s",
+        String(conversationId),
+        errMsg(err),
+      );
+    }
+  }
   if (
     mirror.applied &&
     mirror.prevStatus !== null &&
@@ -3555,13 +5149,15 @@ export async function processChatwootDelivery(
     const closingInboxId = n.inboxId ?? storedInboxId;
     const closingContactInboxId = n.contactInboxId ?? storedContactInboxId;
     try {
-      const closingRt = await inboxAgentRuntime(
+      // NOTE: The responder's alone. An observer's route remembers nothing on an inbox without one
+      // (`routeRemembers`, issue #620), so there is no memory of its own to compact.
+      const responderClosingRt = await inboxAgentRuntime(
         params.tenantId,
         params.instanceId,
         closingInboxId,
         base,
       );
-      if (closingRt) {
+      if (responderClosingRt) {
         // Memory compaction: an attendance that ended is an attendance that can become a summary.
         // Armed here, with a grace period, so the thread is already compacted BEFORE the customer
         // comes back — measurement says the resumption turn is the one billed fresh (cache rate
@@ -3575,9 +5171,10 @@ export async function processChatwootDelivery(
               instanceId: params.instanceId,
               contactInboxId: closingContactInboxId,
               conversationId,
-              agentId: closingRt.agentId,
+              agentId: responderClosingRt.agentId,
               reason: "resolved",
-              enabled: readMemoryConfig(closingRt.settings).compaction.enabled,
+              enabled: readMemoryConfig(responderClosingRt.settings).compaction
+                .enabled,
               base,
             });
           } catch (err) {
@@ -3588,11 +5185,19 @@ export async function processChatwootDelivery(
             );
           }
         }
-        const redirectCfg = readChannelRedirectConfig(closingRt.settings);
+        // THE REDIRECT IS THE RESPONDER'S, never the watcher's (issue #476 review, round 25). This
+        // block ends in customer-facing text on the WhatsApp sibling, and an observer answers
+        // nothing whatever its mode says. Read off the responder alone, so the guarantee is
+        // structural here rather than left to the fences downstream, and so the configuration that
+        // decides it belongs to the agent that would send.
+        const redirectCfg = readChannelRedirectConfig(
+          responderClosingRt?.settings,
+        );
         // The redirect keys off the EVENT's inbox (it is the widget conversation that resolved).
         // A sparse payload carries none, and `widgetInboxId === null` would otherwise read as a
         // match on a half-configured agent.
         if (
+          responderClosingRt !== null &&
           redirectCfg.enabled &&
           n.inboxId !== null &&
           redirectCfg.widgetInboxId === n.inboxId
@@ -3622,21 +5227,21 @@ export async function processChatwootDelivery(
             redirectCfg.closingEnabled &&
             redirectCfg.entryInboxId !== null &&
             isRedirectFollowUpLive({
-              agentEnabled: closingRt.enabled,
-              agentMode: closingRt.mode,
+              agentEnabled: responderClosingRt.enabled,
+              agentMode: responderClosingRt.mode,
               // Only a test agent's liveness depends on the stamp, and this read is paid on a path
               // whose failure is permanent: the surrounding best-effort catch sits AFTER the ladder
               // was cancelled, the delivery is marked PROCESSED, and a conversation resolves once —
               // so a transient error here would lose the closing for good. A production agent has
               // nothing to look up.
               testActivatedAt:
-                closingRt.mode === "test"
+                responderClosingRt.mode === "test"
                   ? await episodeActivationForWidget(
                       params.tenantId,
                       params.instanceId,
                       conversationId,
                       redirectCfg,
-                      closingRt.mode,
+                      responderClosingRt.mode,
                       base,
                     )
                   : null,
@@ -3732,17 +5337,61 @@ export async function processChatwootDelivery(
       rt.mode,
       base,
     )) !== null;
+  // A TEST responder analyses media too, on the answer path, in a conversation somebody activated
+  // (issue #476 review, round 13) — so the observer stands down there as well, for the same reason
+  // it stands down beside a continuously ingesting one. Asked only where it can be true: an observer
+  // route beside a test responder.
+  const responderAnalysesMedia =
+    responderRemembers ||
+    (responderCovers &&
+      responderRt?.enabled === true &&
+      responderRt.mode === "test" &&
+      // ...and only where that route would REACH its answer path (round 17): a conversation a human
+      // owns, or one its bot does not hold, is one the responder never answers and never analyses,
+      // so suppressing the pass here would leave the audio unread by everyone.
+      shouldBotHandle(
+        {
+          assigneeType: effectiveAssigneeType,
+          status: effectiveStatus,
+          assigneeId: effectiveAssigneeId,
+        },
+        { ourAgentBotId: responderBotId },
+      ) &&
+      n.conversationId !== null &&
+      (await episodeActivationForWidget(
+        params.tenantId,
+        params.instanceId,
+        n.conversationId,
+        readChannelRedirectConfig(responderRt.settings),
+        responderRt.mode,
+        base,
+      )) !== null);
+  // NOT from an observer's route beside a responder that remembers (issue #476 review, round 5):
+  // both routes receive the same audio, and both would transcribe it — twice the provider bill, and
+  // two writes racing into the same attachment's stash, so the loser's text is what the other route
+  // then reads back as context. The pass follows the memory: this route runs it exactly when it is
+  // the one that will remember the message (`responderAnalysesMedia` is false on the responder's own
+  // route, and beside a switched-off responder, which transcribes nothing here).
+  // A ROW-BACKED observer analyses media whatever its mode says, for the reason its ingestion does
+  // (issue #476 review, round 20): the row is written without re-asking the mode, and a watcher that
+  // remembers an audio as an attachment marker instead of its transcription remembers nothing of it.
+  const watcherReads = observer !== null;
   if (
     rt?.enabled &&
-    ((isNewIncoming && ingestsContinuously(rt.mode)) ||
+    !responderAnalysesMedia &&
+    ((isNewIncoming && (ingestsContinuously(rt.mode) || watcherReads)) ||
       (hasLateMedia &&
-        (ingestsContinuously(rt.mode) || activatedTestLateMedia)))
+        (ingestsContinuously(rt.mode) ||
+          watcherReads ||
+          activatedTestLateMedia)))
   ) {
     await runEagerMedia(params.tenantId, params.instanceId, n, base, {
       conversationId: mirror.conversationRowId,
       agentId: rt.agentId,
       inboxId: rt.inboxId,
       chatwootInboxId: rt.chatwootInboxId,
+      deliveryRowId: params.deliveryRowId,
+      sleep: params.deps?.sleep,
     });
   }
 
@@ -3804,6 +5453,10 @@ export async function processChatwootDelivery(
   const settleDelivery = async (
     messageId: number,
     settlement: "answered" | "consumed",
+    // Whether a turn folded the message into the thread — a different question from the settlement,
+    // and only the caller knows (issue #576). Ignored on the `this-delivery` scope, which speaks for
+    // one route rather than for the message.
+    covered: boolean,
     scope: "conversation" | "this-delivery" = "conversation",
   ): Promise<void> => {
     // Narrows for the call below, which takes a number. Every caller is already inside a branch that
@@ -3816,9 +5469,12 @@ export async function processChatwootDelivery(
         conversationId: n.conversationId,
         conversationRowId: mirror.conversationRowId,
         settlement,
+        // `covered` rides the wide scope only: a single-row settlement is this route reporting about
+        // ITSELF, and "I am not handling this" says nothing about the route that is (issue #576, PR
+        // review round 4). The union in ../chatwoot/delivery-sweep.ts is what enforces it.
         ...(scope === "this-delivery"
           ? { deliveryRowId: params.deliveryRowId }
-          : { messageIds: [messageId] }),
+          : { messageIds: [messageId], covered }),
         base,
       });
     } catch (e) {
@@ -3874,6 +5530,8 @@ export async function processChatwootDelivery(
         agentId: rt?.agentId ?? null,
         inboxId: rt?.inboxId ?? null,
         chatwootInboxId: rt?.chatwootInboxId ?? null,
+        deliveryRowId: params.deliveryRowId,
+        sleep: params.deps?.sleep,
       });
 
       // Debounce path: an incoming message on a debounce-enabled agent re-arms the durable DEBOUNCE
@@ -3947,7 +5605,49 @@ export async function processChatwootDelivery(
           // write is fire-and-forget. That is the point: the contract must not rest on a property of
           // three unrelated call sites that any of them could drop. Bound to the turn here, it
           // cannot.
+          // WHETHER THE MESSAGE ENDED UP IN THE THREAD, reported by the runtime and WRITTEN THERE
+          // (issue #576). Not carried to the settlement below: a TTS or a send that fails after the
+          // invoke jumps to the catch, tx2 closes the row anyway, and the fact would be lost on a row
+          // that really does hold the message. Same rule as `settleDelivery` itself — record the
+          // decision where it is made, never later.
+          let turnFoldedIn = false;
+          const onFoldedIn = async (): Promise<void> => {
+            // ONLY THE MESSAGE WHOSE WORDS THE TURN HAD, and the flag says the same (issue #576, PR
+            // review round 8). A voice note still waiting on STT reaches the graph as a placeholder,
+            // and claiming it — here or at the settlement below, which reads this flag — suppresses
+            // the very ingest the write-back exists to arm.
+            if (
+              n.message?.id == null ||
+              n.conversationId === null ||
+              !turnHadTheWords({
+                // FROM THE FILE TYPES, not from `firstAudioAttachment` (PR review, round 9). That
+                // one answers whether STT could RUN — it requires a usable id and data_url — and an
+                // audio whose url has not landed yet fails it while still reaching the graph as a
+                // placeholder. Asked that way, the message read as "no audio", coverage was claimed,
+                // and the transcription that followed was suppressed. The debounce path was already
+                // asking the file types; this makes the two the same question.
+                hasAudio: (n.message?.attachments ?? []).some(
+                  (a) => a.fileType === "audio",
+                ),
+                transcribedText: n.message?.transcribedText,
+              })
+            )
+              return;
+            turnFoldedIn = true;
+            // COVERAGE ONLY, and never the settlement: settling here would close the row mid-turn,
+            // and a closed row is a delivery the sweep can no longer see. The settlement below is
+            // what says whether a reply reached the customer.
+            await recordTurnCoverage({
+              tenantId: params.tenantId,
+              instanceId: params.instanceId,
+              conversationId: n.conversationId,
+              covered: true,
+              messageIds: [n.message.id],
+              base,
+            });
+          };
           const outcome = await runAgentTurn({
+            onFoldedIn,
             tenantId: params.tenantId,
             instanceId: params.instanceId,
             agentBotId: params.agentBotId,
@@ -4032,6 +5732,16 @@ export async function processChatwootDelivery(
               outcome === "posted" || outcome === "posted-partial"
                 ? "answered"
                 : "consumed",
+              // NOT the same reading as the word beside it: `graph.invoke` persists the channel, so
+              // a turn that ran and stayed silent left the message in memory while settling
+              // `consumed` (issue #576). Reported by the runtime rather than read off the outcome,
+              // which straddles the invoke in both directions: the input guardrail's replacement
+              // answers `posted` before it, the output guardrail's suppression `blocked` after it.
+              // The runtime's own answer, kept rather than hardcoded `false` (PR review, round 6).
+              // `onFoldedIn` already wrote it, but that write is best-effort: a transient failure
+              // there followed by an unconditional `false` here would put the LIE on the row, where
+              // repeating the true answer leaves the null the reader falls back on at worst.
+              turnFoldedIn,
             );
           }
           // NOTE: The turn had nowhere to go: no agent is bound to this inbox (issue #318). One line
@@ -4274,6 +5984,8 @@ export async function processChatwootDelivery(
       agentId: rt.agentId,
       inboxId: rt.inboxId,
       chatwootInboxId: rt.chatwootInboxId,
+      deliveryRowId: params.deliveryRowId,
+      sleep: params.deps?.sleep,
     });
   }
   // THE OBSERVER'S OWN REASON TO MARK is its ingestion having the message (issue #209 review,
@@ -4363,29 +6075,42 @@ export async function processChatwootDelivery(
     // list that is wrong and VISIBLE, and correctable by the next turn that runs over it.
     //
     // Wrong and visible over quiet and wrong is the rule this whole change is built on.
-    try {
-      await advanceHandledWatermark({
-        tenantId: params.tenantId,
-        conversationDbId: conversationRowId,
-        toMessageId: messageId,
-        base,
-      });
-    } catch (err) {
-      logger.warn(
-        "chatwoot: advance handled watermark failed (conv=%s): %s",
-        convLabel,
-        errMsg(err),
-      );
-      if (opts.onWatermarkFailure === "leave-for-sweep") {
-        throw new Error(
-          `chatwoot: the observed message's watermark could not be advanced (conv=${convLabel}); leaving the delivery for the sweep`,
+    //
+    // THE WATERMARK BELONGS TO THE REPLY PATH (issue #476). On an observer's route, with a
+    // responder of ours bound to the same inbox, the responder's own delivery of this message is
+    // the one that answers or deliberately skips it, and an observer advancing the shared mark
+    // would take the message out of that flush. With no responder, the observer is the only thing
+    // keeping the mark, and keeping it is what stops a responder bound later from answering the
+    // whole observed backlog as one burst. Its settlement is scoped the same way another bot's
+    // is: this row only, never the responder's.
+    if (!responderMayAnswer) {
+      try {
+        await advanceHandledWatermark({
+          tenantId: params.tenantId,
+          conversationDbId: conversationRowId,
+          toMessageId: messageId,
+          base,
+        });
+      } catch (err) {
+        logger.warn(
+          "chatwoot: advance handled watermark failed (conv=%s): %s",
+          convLabel,
+          errMsg(err),
         );
+        if (opts.onWatermarkFailure === "leave-for-sweep") {
+          throw new Error(
+            `chatwoot: the observed message's watermark could not be advanced (conv=${convLabel}); leaving the delivery for the sweep`,
+          );
+        }
       }
     }
     await settleDelivery(
       messageId,
       "consumed",
-      heldByAnotherBot ? "this-delivery" : "conversation",
+      // This whole path is the one no turn takes: the gate closed, a person or another bot holds the
+      // conversation, or the observer owes the memory instead. Nothing invoked a graph.
+      false,
+      heldByAnotherBot || observer !== null ? "this-delivery" : "conversation",
     );
   };
   if (isNewIncoming && (!act || consumed) && !observerHolds) {
@@ -4483,14 +6208,82 @@ export async function processChatwootDelivery(
   // this delivery was decided with, and a TEST agent — which ingests only on its answer path —
   // flipped to monitoring inside its turn would otherwise have its message marked handled by the
   // stand-down and refused here. `agentObservesNow` already read the switch and the mode fresh.
+  //
+  // NOT from an observer's route beside a responder of ours: that responder's route remembers the
+  // message (`responderRemembers` above), and a second append from here is the duplicate.
+  // NOR A CONTROL COMMAND THE RESPONDER WILL HANDLE (issue #476 review, rounds 9 and 10): `/teste`
+  // and `/reset` are the responder's, and this route reads them as ordinary text because the mode it
+  // decides with is the observer's. Folded in, the command becomes a line of the shared thread — and
+  // an ingestion racing the responder's `/reset` would append it back after the reset emptied the
+  // memory. Only where that responder REALLY handles it, though: a command is active for a test
+  // agent alone, and only on a route the fork can reach — outside that, "/reset" is ordinary text
+  // somebody typed, and dropping it here would lose it from every memory.
+  // NOT gated on the responder being switched ON: a command is active on its mode alone, and the
+  // responder's gate is entered by `act || commandActive`, so a disabled test agent still consumes
+  // its `/reset` (issue #476 review, round 13). Requiring `enabled` here would have this route fold
+  // that `/reset` in as ordinary text, after the reset emptied the thread.
+  const responderCommand =
+    command !== null &&
+    observer !== null &&
+    responderRt !== null &&
+    responderRt.mode === "test" &&
+    responderHasRoute &&
+    // ...and only for a command that responder's route actually RECEIVED (round 33): bound after
+    // the emission, it never got the `/reset`, and dropping it here loses it from every memory.
+    responderCovers;
+  // NOTE: ASKED AGAIN, AFTER THE ANALYSIS (issue #478 review, round 4). The value read at the top of this
+  // function is the WIRE's answer, and it is the right one there: it decides whether the event
+  // reaches the runtime at all, before anything has looked at the audio. By here the eager pass may
+  // have produced the words itself — a `message_updated` that arrived carrying raw audio — and from
+  // that moment this delivery owes the append and everything that protects it. Read from the top's
+  // value, the retry and the failure guard below would both stand down on exactly the delivery that
+  // paid a provider for the transcription.
+  const carriesTranscription = inboundTranscriptionOnUpdate(n) !== null;
   let ingested: IngestOutcome = "nothing";
-  if (
-    rt !== null &&
-    ((rt.enabled && ingestsContinuously(rt.mode)) || handedToObserver)
-  ) {
+  // NOTE: WHETHER THIS ROUTE INGESTS AT ALL, hoisted out of the condition below so the two halves can
+  // be told apart (issue #478 review, round 8). A route that cannot — no runtime, switched off, a
+  // test agent with nobody watching — reaches no branch and says nothing, and that silence is what a
+  // memory-only recovery reads as "nobody looked". A route that CAN and stands down for the
+  // responder is the opposite, and has to say so.
+  //
+  // TWO HALVES, and only the first is a fact about this route: `routeRemembers` was resolved before
+  // the claim and WRITTEN there (issue #540, window 3), so the sibling observer reads what this
+  // delivery decided rather than a switch as it stands later. The second is this delivery handing
+  // the message to a watcher, decided here — and where it happens it CORRECTS the recorded fact,
+  // below, because the claim's `false` stops being true the moment this delivery ingests anyway.
+  const routeIngests = rt !== null && (routeRemembers || handedToObserver);
+  // THE RECORD FOLLOWS THE HAND-OVER (issue #540, PR review round 4). A responder whose runtime was
+  // in test mode at the claim records `false`, and a flip to monitoring discovered mid-delivery
+  // (`handedToObserver`) makes that same delivery fold the message in after all. Left at `false`,
+  // the row tells the observer beside it that nobody remembered — and the observer, which trusts
+  // the recorded fact over the current mode, appends the same message to the same contact-inbox
+  // thread a second time.
+  //
+  // Guarded on the value it corrects, so it can only ever move `false` to `true`: a redelivery, a
+  // replay and a concurrent reader all leave a row that already says `true` alone. Best-effort and
+  // not thrown: the delivery's own work is the ingestion below, and taking that away to report a
+  // stale sibling fact would trade a duplicate line in memory for a missing one.
+  if (routeIngests && !routeRemembers) {
+    await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+      db.chatwootWebhookDelivery.updateMany({
+        where: { id: params.deliveryRowId, routeRemembers: false },
+        data: { routeRemembers: true },
+      }),
+    ).catch((err) => {
+      logger.warn(
+        "chatwoot: could not record that this delivery handed the message to a watcher (conv=%s): %s; an observer beside it may append the same message a second time",
+        n.conversationId === null ? "?" : String(n.conversationId),
+        errMsg(err),
+      );
+    });
+  }
+  // `rt !== null` again, and it is the type checker's rather than the logic's: `routeIngests`
+  // already implies it, but the narrowing does not survive the const.
+  if (rt !== null && routeIngests && !responderRemembers && !responderCommand) {
     ingested = await ingestUnhandledMessage({
       tenantId: params.tenantId,
       instanceId: params.instanceId,
+      deliveryRowId: params.deliveryRowId,
       n,
       act: act && !observing && !handedToObserver,
       consumed,
@@ -4507,23 +6300,81 @@ export async function processChatwootDelivery(
           mirror.conversationRowId,
           base,
         )),
-      retryArm: observing || handedToObserver,
+      // NOTE: ...and for a LATE TRANSCRIPTION on any route (issue #478 review, round 2), for the reason the
+      // observer's is retried: the append is the last chance. The words come around once, on the
+      // write-back, and no later event carries them — production's continuous ingestion is
+      // best-effort because a turn covers what it misses, and here no turn ever will.
+      retryArm: observing || handedToObserver || carriesTranscription,
       sleep: params.deps?.sleep,
       base,
     });
+    // NOTE: Inside the branch, so silence means the ingestion never ran rather than that it ran and
+    // found nothing. That is the distinction the recovery reads (see `onIngest`).
+    params.onIngest?.(ingested);
+    // ...AND THE RECORD FOLLOWS THE OUTCOME, not only the intent (PR review, round 16). The claim
+    // wrote `routeRemembers` from the runtime it resolved, and this is where that promise is either
+    // kept or not: `failed` and `no-thread` are the two ways it ends unkept, and the delivery still
+    // settles PROCESSED either way. Left saying `true`, the row tells the observer beside it that
+    // this message is remembered — and for a colleague's reply nothing else will ever fold it in,
+    // since no recovery carries an outgoing body.
+    //
+    // `nothing` is NOT one of them: there was nothing to fold in, which is not a promise broken.
+    //
+    // Guarded on the value it corrects, so it only ever moves `true` to `false`, and best-effort for
+    // the same reason its twin above is: this delivery's own work is done, and failing it here to
+    // report a stale sibling fact would trade a message the observer can still save for one nobody
+    // does.
+    if (ingested === "failed" || ingested === "no-thread") {
+      await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+        db.chatwootWebhookDelivery.updateMany({
+          where: { id: params.deliveryRowId, routeRemembers: true },
+          data: { routeRemembers: false },
+        }),
+      ).catch((err) => {
+        logger.warn(
+          "chatwoot: could not record that this delivery failed to fold the message in (conv=%s): %s; an observer beside it may stay quiet about a message nothing remembers",
+          n.conversationId === null ? "?" : String(n.conversationId),
+          errMsg(err),
+        );
+      });
+    }
+  } else if (routeIngests) {
+    // NOTE: A route that INGESTS, standing down on purpose: the responder already has this message,
+    // or is about to consume it as a command. Reported, because the recovery's question is "did
+    // anything look at this message", and a deliberate stand-down is an answer (round 8). Silent, an
+    // observer's replay beside a responder would be put back on the worklist until its attempts ran
+    // out, over a message that was handled.
+    params.onIngest?.("covered");
+  } else if (observer?.enabled === true && responderRt === null) {
+    // NOTE: A SWITCHED-ON OBSERVER WITH NO RESPONDER TO REMEMBER FOR (issue #620): a decision
+    // about the message, like the stand-down above, and reported for the same reason. Silent, every
+    // replay of a stranded observer delivery would read as "no route asked" and go back to DEAD
+    // until its attempts ran out, although the watermark and the verdict it owes are this same
+    // delivery's work below. A switched-off observer stays silent: the message waits for its switch.
+    params.onIngest?.("no-reader");
   }
   // A COLLEAGUE'S REPLY the observer could not remember, its retries spent (round 24). There is no
   // recovery to leave the row for — the sweep cannot rebuild an outgoing body — so the loss is
   // reported where an operator reads: an error line on the conversation, not a process warning.
+  //
+  // "no-thread" IS THE SAME LOSS BY A DIFFERENT ROUTE (issue #476 review, round 37), and it is the
+  // permanent one: a conversation whose contact-inbox neither the payload nor the mirror names has
+  // nowhere to hold the reply, so there is nothing to retry and no later attempt that would find
+  // one. Left out of this report it settled silently — `observerHolds` is inbound-only, so the mark
+  // block below never sees an outgoing reply, and the row went PROCESSED with the reply in nobody's
+  // memory and no line anywhere. Reported at the same level and on the same conversation; the
+  // reason names which of the two happened.
   if (
-    ingested === "failed" &&
+    (ingested === "failed" || ingested === "no-thread") &&
     (observing || handedToObserver) &&
     !observerHolds &&
     rt !== null &&
     mirror.conversationRowId !== null
   ) {
     logger.error(
-      "chatwoot: a colleague's reply could not be remembered by the observer (conv=%s): the ingest job was not queued",
+      ingested === "failed"
+        ? "chatwoot: a colleague's reply could not be remembered by the observer (conv=%s): the ingest job was not queued"
+        : "chatwoot: a colleague's reply could not be remembered by the observer (conv=%s): the conversation names no contact-inbox thread to hold it",
       convLabel,
     );
     emitFlowEvent(
@@ -4540,14 +6391,46 @@ export async function processChatwootDelivery(
         level: "error",
         status: "error",
         detail: {
-          reason: "human_reply_not_remembered",
+          reason:
+            ingested === "failed"
+              ? "human_reply_not_remembered"
+              : "human_reply_no_thread",
           messageId: n.message?.id ?? null,
-          attempts: INGEST_ARM_ATTEMPTS,
+          ...(ingested === "failed" ? { attempts: INGEST_ARM_ATTEMPTS } : {}),
         },
       },
     );
   }
-  // The observer's verdict, from the enqueue (see the note above the mark). The throw is the one
+  // NOTE: A LATE TRANSCRIPTION HOLDS THE DELIVERY THE SAME WAY, on every route (issue #478 review,
+  // round 2). `observerHolds` is inbound-only — a `message_updated` is not `isNewIncoming` — so on
+  // its own it settles this delivery PROCESSED whatever the enqueue answered, and a scheduler blip
+  // then discards the transcription for good: the sweep sees a terminal row, and the row is the only
+  // thing that knew.
+  //
+  // ASKED OF EVERY ROUTE and not only the watcher's, because what makes production's continuous
+  // ingestion best-effort is a turn covering what it misses, and there is no turn here by
+  // construction — the words arrive on an update, and an update drives none. Where a turn DID answer
+  // the message, the gate inside the ingestion refuses it and the answer is `"nothing"`, so this
+  // never fires for the ordinary write-back.
+  //
+  // The throw and the one below are the two exits of this function that leave the row on PROCESSING
+  // deliberately: the route logs it, the sweep declares it `owed-transcription`, and the replay
+  // re-runs this path.
+  if (carriesTranscription && ingested === "failed") {
+    throw new Error(
+      `chatwoot: the late transcription could not be armed for ingestion (conv=${convLabel}); leaving the delivery for the sweep`,
+    );
+  }
+  // NOTE: "no-thread" IS NOT THAT, and it is left to settle: a conversation neither the payload nor the
+  // mirror can name a contact-inbox for has nowhere to hold the words, and the replay would find the
+  // same nothing. Said at `warn`, which is where the observer's inbound branch says it too.
+  if (carriesTranscription && ingested === "no-thread") {
+    logger.warn(
+      "chatwoot: a late transcription arrived (conv=%s) but the conversation names no contact-inbox thread to hold it",
+      convLabel,
+    );
+  }
+  // The observer's verdict, from the enqueue (see the note above the mark). The throw is the other
   // exit of this function that leaves the row on PROCESSING deliberately: the route logs it, and
   // the sweep's recovery re-runs the delivery.
   if (observerHolds) {
@@ -4556,13 +6439,140 @@ export async function processChatwootDelivery(
         `chatwoot: the observer's ingestion could not be armed (conv=${convLabel}); leaving the delivery for the sweep`,
       );
     }
-    if (ingested === "no-thread") {
+    // A SWITCHED-OFF observer marks nothing (issue #476 review, round 5). Its route is still the
+    // observer's — nothing on it answers — but ingestion refuses a disabled agent, so the mark would
+    // put the message behind the watermark with no memory holding it. Left unmarked, the message
+    // stays ABOVE the watermark, which is the one place that says a stretch of the conversation was
+    // never read: the flush after a flip to production reads above it (`promotedToProduction`), and
+    // an operator reading the mark sees where the silence began.
+    //
+    // WHAT IT IS NOT (round 6): a replay. Turning a monitoring agent back on arms nothing, so what
+    // arrived while it was off does not enter memory by itself — the observer's memory has that gap
+    // until a flip to production, and the watcher's own read of the conversation (the OBSERVE job)
+    // reads Chatwoot rather than the checkpoint. The alternative is the one this replaced, marking
+    // the message handled: that loses it just as thoroughly and leaves no trace that it was lost.
+    if (observer !== null && !observer.enabled && !responderRemembers) {
+      logger.warn(
+        "chatwoot: the observer is switched off (conv=%s); the message is neither remembered nor marked",
+        convLabel,
+      );
+    } else if (ingested === "no-thread") {
       logger.warn(
         "chatwoot: the agent observes (conv=%s) but the conversation has no contact-inbox thread; leaving the message unmarked",
         convLabel,
       );
     } else {
       await markHandledAndSettle({ onWatermarkFailure: "leave-for-sweep" });
+    }
+  }
+  // THE WATCHER'S VERDICT (issue #477): a customer message on a conversation the agent observes arms
+  // the OBSERVE row, which reads the conversation from Chatwoot when its window closes. After the
+  // marks and best-effort, like compaction: the memory append above is what this delivery owes, and
+  // a label that is late is not a message that is lost — the next burst arms the same row again.
+  //
+  // ...and only while the watcher is SWITCHED ON (issue #477 review, round 2). `observing` is a
+  // statement about the route, not about the agent: a disabled observer still owns the route, its
+  // ingestion refuses (`ingested` stays `"nothing"`, deliberately, so the message stays above the
+  // watermark for the flush after a flip), and arming here would leave a verdict pending on a
+  // message the agent was explicitly off for. Re-enabled before the window closes, the tick would
+  // then classify and relabel it.
+  //
+  // WHO CLASSIFIES IS ASKED SEPARATELY FROM WHO ANSWERS (issue #477 review, round 4). `rt` is the
+  // reply route's runtime, and that answer is null for a bound observer whose bot still HOLDS the
+  // conversation on an inbox that has a responder — correctly, since the reply is the responder's.
+  // Observation is not a reply, and an observer watches every conversation on its inbox including
+  // the ones its bot happens to hold. So the binding is asked directly, and the two answers are
+  // deduplicated by agent: on the ordinary observer route they are the same runtime.
+  //
+  // ...and NOT for a control command (issue #477 review, round 5). `/teste` and `/reset` are an
+  // operator talking to the runtime, not a customer talking to the business: the responder consumes
+  // them, and a verdict armed on one would classify the conversation off an operator's instruction —
+  // and, in `/reset`'s case, wake up after the command cleared the labels and put them back.
+  if (
+    isNewIncoming &&
+    !commandActive &&
+    n.conversationId !== null &&
+    ingested !== "failed"
+  ) {
+    const conversationId = n.conversationId;
+    const bound = await boundObserverRuntime(
+      params.tenantId,
+      params.instanceId,
+      params.agentBotId,
+      {
+        chatwootInboxId: n.inboxId,
+        chatwootConversationId: conversationId,
+      },
+      base,
+    ).catch((err) => {
+      logger.warn(
+        "chatwoot: reading the inbox's observer binding for the verdict failed (conv=%s): %s",
+        String(conversationId),
+        errMsg(err),
+      );
+      return null;
+    });
+    // THE HAND-OVER ANSWER, NOT THE SNAPSHOT'S `enabled` (issue #477 review, round 20). `observing`
+    // was derived from `rt` and agrees with it; `handedToObserver` comes from a FRESH read that
+    // already established enabled AND monitoring, so gating it on the loaded `rt.enabled` rejects
+    // exactly the agent that was switched on inside this delivery — while ingestion and the
+    // watermark have already treated the message as observed, and `bound` is null because a
+    // responder holds no observer row. The message would then wait for another trigger.
+    const watchers =
+      rt !== null && (handedToObserver || (rt.enabled && observing))
+        ? [rt]
+        : [];
+    if (bound?.enabled && !watchers.some((w) => w.agentId === bound.agentId))
+      watchers.push(bound);
+    // Only the REPLY-ROUTE answer can be an attach-window one (round 15): `bound` IS the row, and a
+    // detached bot that still owns an older conversation keeps receiving its events, so "no row"
+    // there is the post-detach state as often as the pre-commit one.
+    const attachingAgentId =
+      observerHolds && rt !== null && observerAttaching ? rt.agentId : null;
+    // A HAND-OVER MEANS THE SNAPSHOT IS OLD (issue #477 review, round 12). `observing` was read off
+    // `rt` and agrees with it; `handedToObserver` is the opposite case — the runtime was loaded as a
+    // responder and a FRESH read found it monitoring, so the flip landed inside this delivery and
+    // `rt.settings` predates it. The edit that flips the mode is usually the edit that adds the label
+    // groups, so arming off the old bag answers `off` and the message is remembered and never
+    // classified. `boundObserverRuntime` cannot cover it either: that agent is the inbox's responder,
+    // so it holds no observer row. One read, on a path that only runs when a mode flip raced a
+    // delivery; an unreadable answer keeps the snapshot, since a stale taxonomy is better than none.
+    const freshSettings =
+      handedToObserver && !observing && rt !== null
+        ? await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+            db.agent.findUnique({
+              where: { id: rt.agentId },
+              select: { settings: true },
+            }),
+          )
+            .then((a) => a?.settings ?? null)
+            .catch((err) => {
+              logger.warn(
+                "chatwoot: re-reading the handed-over watcher's settings failed (conv=%s): %s",
+                String(conversationId),
+                errMsg(err),
+              );
+              return null;
+            })
+        : null;
+    for (const watcher of watchers) {
+      await armObserve({
+        tenantId: params.tenantId,
+        instanceId: params.instanceId,
+        conversationId,
+        agentId: watcher.agentId,
+        reason: "burst",
+        cfg: readMonitoringConfig(
+          freshSettings !== null && watcher.agentId === rt?.agentId
+            ? freshSettings
+            : watcher.settings,
+        ),
+        // The message this burst is about, in Chatwoot's own sequence: the reset fence the tick is
+        // held to is asked in that order and in no other.
+        atMessageId: n.message?.id ?? null,
+        attaching: watcher.agentId === attachingAgentId,
+        base,
+      });
     }
   }
 

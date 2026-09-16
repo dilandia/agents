@@ -10,7 +10,11 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import { tool } from "@langchain/core/tools";
 import { MemorySaver } from "@langchain/langgraph";
 import { z } from "zod";
-import { buildAgentGraph, lastAssistantText } from "@/graph/graph";
+import {
+  buildAgentGraph,
+  lastAssistantText,
+  recursionLimitFor,
+} from "@/graph/graph";
 import { CALLED_OFF_TOOL_RESULT } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
 import { SKIP_REPLY_TOOL } from "@/graph/silence";
@@ -74,7 +78,7 @@ describe("agentNode system-message normalization", () => {
 // A model that keeps calling a tool while tools are bound, and answers in text when they are NOT
 // (the hard-limit path invokes the raw model). Records the system prompt seen on each bound invoke.
 class ToolLoopModel {
-  boundSystemPrompts: string[] = [];
+  boundRounds: BaseMessage[][] = [];
   rawInvokes = 0;
   // Hard-limit path: raw model, no tools → a plain text answer ends the turn.
   async invoke(_messages: BaseMessage[]): Promise<AIMessage> {
@@ -87,7 +91,7 @@ class ToolLoopModel {
     return {
       async invoke(messages: BaseMessage[]): Promise<AIMessage> {
         n++;
-        self.boundSystemPrompts.push(String(messages[0]?.content ?? ""));
+        self.boundRounds.push(messages);
         return new AIMessage({
           content: "",
           tool_calls: [{ name: "noop", args: {}, id: `call_${n}` }],
@@ -96,6 +100,11 @@ class ToolLoopModel {
     };
   }
 }
+
+// The soft limit's wrap-up instruction, recognized wherever it sits in a request.
+const WRAP_UP = "[Sistema] Você já usou";
+const carriesWrapUp = (round: BaseMessage[]) =>
+  round.some((m) => contentToText(m.content).includes(WRAP_UP));
 
 const noopTool = tool(async () => "feito", {
   name: "noop",
@@ -126,7 +135,7 @@ describe("agentNode tool-call limit (soft+hard)", () => {
     const skipTool = realSkipTool();
     // One skip_reply call, then an empty answer — the shape a silent turn actually has.
     class SkipThenSilentModel {
-      boundSystemPrompts: string[] = [];
+      boundRounds: BaseMessage[][] = [];
       async invoke(): Promise<AIMessage> {
         return new AIMessage("");
       }
@@ -136,7 +145,7 @@ describe("agentNode tool-call limit (soft+hard)", () => {
         return {
           async invoke(messages: BaseMessage[]): Promise<AIMessage> {
             n++;
-            self.boundSystemPrompts.push(String(messages[0]?.content ?? ""));
+            self.boundRounds.push(messages);
             if (n === 1) {
               return new AIMessage({
                 content: "",
@@ -163,12 +172,8 @@ describe("agentNode tool-call limit (soft+hard)", () => {
     );
     // ONE round: the decision ended the turn. The wrap-up instruction cannot land because there is
     // no round after it to land on (the control below proves the same cap DOES produce it).
-    expect(model.boundSystemPrompts).toHaveLength(1);
-    expect(
-      model.boundSystemPrompts.some((p) =>
-        p.includes("[Sistema] Você já usou"),
-      ),
-    ).toBe(false);
+    expect(model.boundRounds).toHaveLength(1);
+    expect(model.boundRounds.some(carriesWrapUp)).toBe(false);
     expect(String(result.messages.at(-1)?.content ?? "")).toBe("");
   });
 
@@ -1470,7 +1475,7 @@ describe("agentNode tool-call limit (soft+hard)", () => {
       schema: z.object({}),
     });
     class ParallelThenSilentModel {
-      boundSystemPrompts: string[] = [];
+      boundRounds: BaseMessage[][] = [];
       async invoke(): Promise<AIMessage> {
         return new AIMessage("");
       }
@@ -1480,7 +1485,7 @@ describe("agentNode tool-call limit (soft+hard)", () => {
         return {
           async invoke(messages: BaseMessage[]): Promise<AIMessage> {
             n++;
-            self.boundSystemPrompts.push(String(messages[0]?.content ?? ""));
+            self.boundRounds.push(messages);
             if (n === 1) {
               return new AIMessage({
                 content: "",
@@ -1513,12 +1518,8 @@ describe("agentNode tool-call limit (soft+hard)", () => {
     // called something else is not terminal (round 18) — which is exactly why reading the whole
     // batch still matters: the wrap-up instruction would otherwise land on the round after a
     // decision to stay quiet.
-    expect(model.boundSystemPrompts.length).toBeGreaterThanOrEqual(2);
-    expect(
-      model.boundSystemPrompts.some((p) =>
-        p.includes("[Sistema] Você já usou"),
-      ),
-    ).toBe(false);
+    expect(model.boundRounds.length).toBeGreaterThanOrEqual(2);
+    expect(model.boundRounds.some(carriesWrapUp)).toBe(false);
   });
 
   test("forces a no-tools answer at the hard limit and fires onToolLimit", async () => {
@@ -1544,15 +1545,156 @@ describe("agentNode tool-call limit (soft+hard)", () => {
     // Hard limit fired exactly once, at maxToolCalls executions.
     expect(hits).toHaveLength(1);
     expect(hits[0]).toEqual({ maxToolCalls: 3, toolCalls: 3 });
-    // The soft "wrap up" instruction was appended once the budget got close (N-2 = 1 execution in).
-    expect(
-      model.boundSystemPrompts.some((p) =>
-        p.includes("[Sistema] Você já usou"),
-      ),
-    ).toBe(true);
-    // The first invoke (0 executions) used the plain prompt.
-    expect(model.boundSystemPrompts[0]).toBe("PROMPT");
+    // The soft "wrap up" instruction was sent once the budget got close (N-2 = 1 execution in), and
+    // the first invoke (0 executions) went without it.
+    expect(model.boundRounds.map(carriesWrapUp)).toEqual([false, true, true]);
   });
+
+  // Issue #628. The wrap-up is an instruction, so it travels in a role a customer cannot type into:
+  // "[Sistema] ..." in a chat message arrives as a human message, and a real instruction sent the
+  // same way would be indistinguishable from it. Checked on every path below, whatever else differs.
+  const humanCarriesWrapUp = (round: BaseMessage[]) =>
+    carriesWrapUp(round.filter((m) => m.getType() === "human"));
+
+  const runToTheCap = async (
+    threadId: string,
+    primary: string,
+    fallbackProvider?: string,
+    noReplyChannel?: boolean,
+  ) => {
+    const model = new ToolLoopModel();
+    const graph = buildAgentGraph({
+      primary: { provider: primary, model: "test-model" },
+      model: model as unknown as BaseChatModel,
+      ...(fallbackProvider
+        ? {
+            fallback: {
+              model: new ToolLoopModel() as unknown as BaseChatModel,
+              provider: fallbackProvider,
+              modelId: "fallback-model",
+            },
+          }
+        : {}),
+      systemPrompt: "PROMPT",
+      checkpointer: new MemorySaver(),
+      tools: [noopTool],
+      maxToolCalls: 3,
+      ...(noReplyChannel ? { noReplyChannel: true } : {}),
+    });
+    const result = await graph.invoke(
+      { messages: [new HumanMessage("faça muitas coisas")] },
+      { configurable: { thread_id: threadId } },
+    );
+    return { rounds: model.boundRounds, result };
+  };
+
+  // ISSUE #629. An observation turn has nobody to answer: its frame says any text it writes reaches
+  // nowhere and its client is muted. The budget is the same, the sentence after it is not.
+  const REPLY_SENTENCE = "responda ao cliente";
+  const roundWithWrapUp = (rounds: BaseMessage[][]) => {
+    const round = rounds.find(carriesWrapUp);
+    if (!round) throw new Error("no round carried the wrap-up");
+    return round.map((m) => contentToText(m.content)).join("\n");
+  };
+
+  test("a turn with no reply channel is told to finish with its tools, never to answer a customer", async () => {
+    const { rounds } = await runToTheCap(
+      "limit-noreply",
+      "openai",
+      undefined,
+      true,
+    );
+    expect(rounds.map(carriesWrapUp)).toEqual([false, true, true]);
+    const sent = roundWithWrapUp(rounds);
+    expect(sent).not.toContain(REPLY_SENTENCE);
+    expect(sent).toContain("encerre sem escrever nada");
+    // NOTE: the budget itself is unchanged, and so is where the instruction travels.
+    expect(sent).toContain("1 de 3 ferramentas");
+    for (const round of rounds) expect(humanCarriesWrapUp(round)).toBe(false);
+  });
+
+  test("an ordinary turn still gets the answer-the-customer wording", async () => {
+    const { rounds } = await runToTheCap("limit-reply", "openai");
+    expect(roundWithWrapUp(rounds)).toContain(REPLY_SENTENCE);
+  });
+
+  test("the wording follows the turn, not the provider", async () => {
+    const { rounds } = await runToTheCap(
+      "limit-noreply-anthropic",
+      "anthropic",
+      undefined,
+      true,
+    );
+    // NOTE: inside the system prompt here, and still without the reply sentence.
+    const prompt = contentToText(rounds[1]?.[0]?.content ?? "");
+    expect(prompt).toContain(WRAP_UP);
+    expect(prompt).not.toContain(REPLY_SENTENCE);
+  });
+
+  // Where every destination takes a system message after the history, the instruction goes there,
+  // because a provider caches a request by its exact prefix: nothing a previous round sent may
+  // change, not the system prompt and not the history.
+  test("on openai the wrap-up is a system message after the history, and everything before it is what the previous round sent", async () => {
+    const { rounds, result } = await runToTheCap("limit-prefix", "openai");
+    expect(rounds).toHaveLength(3);
+    const shape = (m: BaseMessage) =>
+      `${m.getType()}:${contentToText(m.content)}`;
+    for (const [i, round] of rounds.entries()) {
+      // The system prompt is the same bytes on every round, instruction or not.
+      expect(round[0]?.getType()).toBe("system");
+      expect(round[0]?.content).toBe("PROMPT");
+      expect(humanCarriesWrapUp(round)).toBe(false);
+      const systems = round.filter((m) => m.getType() === "system");
+      if (carriesWrapUp(round)) {
+        // The last message, a system one, and the only place the instruction is.
+        expect(round.at(-1)?.getType()).toBe("system");
+        expect(contentToText(round.at(-1)?.content ?? "")).toContain(WRAP_UP);
+        expect(carriesWrapUp(round.slice(0, -1))).toBe(false);
+        expect(systems).toHaveLength(2);
+      } else {
+        expect(systems).toHaveLength(1);
+      }
+      // Everything this round sent before its instruction opens the next round, message for message.
+      const next = rounds[i + 1];
+      if (!next) continue;
+      const kept = carriesWrapUp(round) ? round.slice(0, -1) : round;
+      expect(next.slice(0, kept.length).map(shape)).toEqual(kept.map(shape));
+    }
+    // Sent, not persisted: the thread the next turn loads carries no instruction.
+    expect(carriesWrapUp(result.messages)).toBe(false);
+  });
+
+  // Anywhere else the late system message is refused before a request is made (Google, Anthropic) or
+  // reaches a server whose rules are unknown, so the instruction stays inside the system prompt —
+  // including when only the FALLBACK is such a provider, because it is handed the same messages.
+  test.each([
+    { label: "an anthropic agent", primary: "anthropic" },
+    { label: "a google agent", primary: "google" },
+    { label: "an openrouter agent", primary: "openrouter" },
+    {
+      label: "an openai agent whose fallback is google",
+      primary: "openai",
+      fallback: "google",
+    },
+  ])(
+    "on $label the wrap-up stays inside the one system prompt",
+    async ({ primary, fallback }) => {
+      const { rounds, result } = await runToTheCap(
+        `limit-prompt-${primary}-${fallback ?? "none"}`,
+        primary,
+        fallback,
+      );
+      expect(rounds.map(carriesWrapUp)).toEqual([false, true, true]);
+      for (const round of rounds) {
+        expect(round.filter((m) => m.getType() === "system")).toHaveLength(1);
+        expect(round[0]?.getType()).toBe("system");
+        expect(round.at(-1)?.getType()).not.toBe("system");
+        expect(humanCarriesWrapUp(round)).toBe(false);
+      }
+      expect(contentToText(rounds[1]?.[0]?.content ?? "")).toContain(WRAP_UP);
+      expect(carriesWrapUp(result.messages)).toBe(false);
+    },
+  );
 });
 
 // The ceiling is wired through the node, so what it is worth is measured where it matters: in the
@@ -1880,5 +2022,27 @@ describe("the tool boundary refuses a turn that was called off", () => {
       { configurable: { thread_id: "cost-no-hop" } },
     );
     expect(asked).toBe(0);
+  });
+});
+
+// LANGGRAPH COUNTS SUPER-STEPS, NOT TOOL CALLS. One round of "the model calls a tool, the tool node
+// runs it" is two steps, so its default 25 runs out at about twelve rounds — and `maxToolCalls` is
+// an operator setting that goes to 50. A budget the graph cannot reach is a turn that dies with
+// `GraphRecursionError` after the tools it already ran have had their side effects, instead of
+// ending at the budget with a text answer.
+describe("the recursion limit tracks the tool budget", () => {
+  test("a budget of 20 gets the steps 20 rounds take", () => {
+    // 2 per round, +1 for the answer the model gives after the last one, +3 of graph overhead.
+    expect(recursionLimitFor(20)).toBe(44);
+  });
+
+  test("it never goes below LangGraph's own default", () => {
+    // A small budget keeps the room it has today: this raises ceilings, it never lowers one.
+    expect(recursionLimitFor(1)).toBe(25);
+    expect(recursionLimitFor(10)).toBe(25);
+  });
+
+  test("no budget means the default budget, not an unbounded graph", () => {
+    expect(recursionLimitFor(undefined)).toBe(recursionLimitFor(10));
   });
 });

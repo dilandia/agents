@@ -40,6 +40,8 @@ function verdict(row: {
   // What the delivery OWED: the human-reply shape the payload carried, or null for every delivery
   // that owed nothing and for every row a build without the column wrote.
   humanReplyShape?: string | null;
+  // Whose route it arrived on: an observer's, the responder's, or a row that never said.
+  routeObserved?: boolean | null;
 }): StrandedVerdict {
   const at = new Date(NOW.getTime() - row.ageMs);
   const claimed = row.claimed ?? true;
@@ -53,6 +55,7 @@ function verdict(row: {
         row.conversationId === undefined ? 41 : row.conversationId,
       inboundMessageId: row.inboundMessageId,
       humanReplyShape: row.humanReplyShape ?? null,
+      routeObserved: row.routeObserved ?? null,
     },
     { now: NOW, staleAfterMs: STALE_MS },
   );
@@ -69,6 +72,7 @@ describe("classifying a delivery stranded non-terminal", () => {
     conversationId?: number | null;
     receivedAgoMs?: number;
     humanReplyShape?: string | null;
+    routeObserved?: boolean | null;
     expected: StrandedVerdict;
   }> = [
     {
@@ -224,6 +228,55 @@ describe("classifying a delivery stranded non-terminal", () => {
       expected: "no-message",
     },
     {
+      // UNLESS IT NAMES A MESSAGE, which is the pair issue #478 added and the only way a
+      // `message_updated` can owe anything: the receiver writes the inbound id on the update that
+      // carried the TRANSCRIPTION, and on nothing else. The words are the whole of what that row
+      // owes, so it is neither `no-message` (the defect, which loses them silently) nor `lost` (a
+      // customer waiting on a reply, which nobody here is).
+      name: "a message_updated naming a message owes its transcription",
+      ageMs: STALE_MS * 3,
+      event: "message_updated",
+      inboundMessageId: 900,
+      expected: "owed-transcription",
+    },
+    {
+      // ANSWERED BEFORE THE LEGACY FENCE, and this is the case that holds the order. The pair that
+      // identifies the row is itself proof this build wrote it — no older build ever wrote an
+      // inbound id on an update — so the fence has nothing to protect, and asked first it would call
+      // this `lost` and page an operator about a customer nobody is keeping waiting.
+      name: "a transcription strand with no claim stamp is still not a loss",
+      ageMs: STALE_MS * 3,
+      event: "message_updated",
+      inboundMessageId: 901,
+      status: "PROCESSING",
+      claimed: false,
+      expected: "owed-transcription",
+    },
+    {
+      // ISSUE #540, window 2. A colleague's reply whose delivery died between the INSERT and the
+      // claim: the shape is on the row (written at INSERT), and the role is not, because the claim
+      // is the statement that writes it. Read as the responder's — which is what shipped — a
+      // WATCHER's row is silently mis-served: the takeover correctly answers `not-owed` and the
+      // observer's lost ingestion, the whole of what that route owed, leaves no trace anywhere.
+      name: "a reply stranded before the claim names no role",
+      ageMs: STALE_MS * 3,
+      inboundMessageId: null,
+      humanReplyShape: "composer",
+      status: "PENDING",
+      claimed: false,
+      expected: "role-unstated",
+    },
+    {
+      // ...and the claim having RUN is what makes a null role evidence again: this build states the
+      // role in that same statement, so a claimed row with none is an older build's, and that is the
+      // population the responder reading exists for.
+      name: "a reply the claim reached with no role is still read as the responder's",
+      ageMs: STALE_MS * 3,
+      inboundMessageId: null,
+      humanReplyShape: "composer",
+      expected: "owed-takeover",
+    },
+    {
       // The guard is on the event NAME, not on the ids: a message event whose id columns an older
       // build never wrote is still the row this sweep exists for.
       name: "a message event from a build we cannot read is still a loss",
@@ -254,6 +307,39 @@ describe("classifying a delivery stranded non-terminal", () => {
       ageMs: STALE_MS * 3,
       inboundMessageId: null,
       humanReplyShape: "device",
+      expected: "owed-takeover",
+    },
+    {
+      // ISSUE #476. The same colleague's reply, on the OBSERVER's route. A takeover steps the
+      // RESPONDER off the conversation and an observer was never on it, so arming one here spends a
+      // job that answers `not-owed` and reports nothing. What this row owed was the observer's
+      // ingestion, which nothing can replay — so it gets a verdict that can be reported.
+      name: "a colleague's reply on an observer's route owes no takeover",
+      ageMs: STALE_MS * 3,
+      inboundMessageId: null,
+      humanReplyShape: "composer",
+      routeObserved: true,
+      expected: "observer-strand",
+    },
+    {
+      // Explicitly the responder's, which is what the receiver writes on every delivery that is not
+      // an observer's: the takeover is owed exactly as before the role existed.
+      name: "the same reply on the responder's own route still owes the takeover",
+      ageMs: STALE_MS * 3,
+      inboundMessageId: null,
+      humanReplyShape: "composer",
+      routeObserved: false,
+      expected: "owed-takeover",
+    },
+    {
+      // A row written before the column, or one stranded before the receiver could state a role. Not
+      // read as a watcher's: the takeover is the answer that shipped, and it is the safe one — the
+      // recovery asks the inbox and answers `not-owed` where there is nothing to hand back.
+      name: "a row that never stated a role keeps the takeover it always owed",
+      ageMs: STALE_MS * 3,
+      inboundMessageId: null,
+      humanReplyShape: "composer",
+      routeObserved: null,
       expected: "owed-takeover",
     },
     {
@@ -326,6 +412,7 @@ describe("classifying a delivery stranded non-terminal", () => {
           conversationId: c.conversationId,
           receivedAgoMs: c.receivedAgoMs,
           humanReplyShape: c.humanReplyShape,
+          routeObserved: c.routeObserved,
         }),
       ).toBe(c.expected);
     });

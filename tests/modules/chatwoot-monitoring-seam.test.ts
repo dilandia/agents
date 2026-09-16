@@ -1010,6 +1010,77 @@ describe.skipIf(!dbUp)("a monitoring agent never answers", () => {
     expect(lines[0]?.status).toBe("error");
   });
 
+  // The PERMANENT half of the same loss (issue #476 review, round 37). A conversation whose
+  // contact-inbox neither the payload nor the mirror names has nowhere to hold the reply, so
+  // ingestion answers "no-thread" — nothing to retry, and no later attempt that would find one.
+  // Reported like the spent retries above: unreported, the row settles with the reply in nobody's
+  // memory and no line anywhere, because the mark block is inbound-only and never sees this.
+  test("a colleague's reply with no memory thread is reported, not settled in silence", async () => {
+    requests.length = 0;
+    const ingestBefore = (await jobs("INGEST_MESSAGE")).length;
+    deliverySeq += 1;
+    messageSeq += 1;
+    const convId = 27;
+    const conv = conversation(convId, {
+      assigneeType: "User",
+      status: "open",
+    }) as Record<string, unknown>;
+    // No contact-inbox anywhere: not in the payload, and the mirror writes none from it either.
+    delete conv.contact_inbox;
+    const n = normalizeChatwootEvent({
+      event: "message_created",
+      id: messageSeq,
+      private: false,
+      content: "Oi! Vou verificar seu pedido agora.",
+      message_type: "outgoing",
+      sender: { id: 5, name: "Ana", type: "user" },
+      conversation: conv,
+    });
+    if (!n) throw new Error("payload did not normalize");
+    const delivery = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `mon-${process.pid}-${deliverySeq}`,
+        event: "message_created",
+        status: "PENDING",
+        conversationId: convId,
+      },
+      select: { id: true },
+    });
+    expect(
+      await processChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryRowId: delivery.id,
+        agentBotId: OUR_BOT,
+        normalized: n,
+        base: appDb,
+      }),
+    ).toBe("processed");
+    expect(customerFacing()).toEqual([]);
+    expect((await jobs("INGEST_MESSAGE")).length).toBe(ingestBefore);
+    const convRow = await row(convId);
+    const lines = await flowLogRows(suDb, {
+      where: { tenantId, stage: "memory", conversationId: convRow?.id },
+    });
+    expect(lines.length).toBe(1);
+    expect(lines[0]?.status).toBe("error");
+    // ...AND THE ROW SAYS SO (issue #540, PR review round 16). The claim wrote `routeRemembers` from
+    // the runtime it resolved, which is a promise; this is the delivery that broke it, and it still
+    // settles PROCESSED. Left saying `true`, an observer beside this route would read the reply as
+    // remembered and stay quiet about one nothing folded in — and for a reply nothing else ever
+    // will, since no recovery carries an outgoing body.
+    expect(
+      (
+        await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+          where: { id: delivery.id },
+          select: { routeRemembers: true },
+        })
+      ).routeRemembers,
+    ).toBe(false);
+  });
+
   test("/teste never activates a monitoring agent, and answers nothing", async () => {
     requests.length = 0;
     await deliver(3, { assigneeType: null, status: "pending" }, "/teste");
@@ -1569,7 +1640,7 @@ describe.skipIf(!dbUp)("a monitoring agent never answers", () => {
 
   test("an agent flipped to monitoring inside the model call runs none of the tools it asked for", async () => {
     // The turn's fence covers the sends; the graph asks its own copy at the tool boundary, and a
-    // copy derived from the episode alone let `assign_label` write — and the slow-tool ack post —
+    // copy derived from the episode alone let `set_labels` write — and the slow-tool ack post —
     // for an agent that had just been flipped (issue #209 review, round 5).
     await suDb.agent.update({
       where: { id: agentDbId },
@@ -1602,7 +1673,7 @@ describe.skipIf(!dbUp)("a monitoring agent never answers", () => {
           const message = new AIMessage({
             content: "",
             tool_calls: [
-              { name: "assign_label", args: { label: "vip" }, id: "call-1" },
+              { name: "set_labels", args: { label: "vip" }, id: "call-1" },
             ],
           });
           return { generations: [{ text: "", message }] };
@@ -1817,7 +1888,139 @@ describe.skipIf(!dbUp)("a monitoring agent never answers", () => {
       const ingested = (await jobs("INGEST_MESSAGE")).map((j) => j.dedupeKey);
       expect(ingested.some((k) => k.endsWith(`:${messageSeq}`))).toBe(true);
       expect((await row(12))?.lastHandledMessageId).toBe(messageSeq);
+      // ...AND THE ROW SAYS SO (issue #540, PR review round 4). The claim recorded `false` — the
+      // runtime it resolved was a test agent, which folds in only what it answers — and this
+      // delivery then ingested anyway. An observer beside this responder reads the RECORDED fact in
+      // preference to the current mode, so a row left at `false` would tell it nobody remembered the
+      // message and it would append the same one to the same thread a second time.
+      expect(
+        (
+          await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+            where: { id: delivery.id },
+            select: { routeRemembers: true },
+          })
+        ).routeRemembers,
+      ).toBe(true);
     } finally {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: {
+          mode: "monitoring",
+          settings: { followUp: { enabled: true } },
+        },
+      });
+    }
+  });
+
+  // The edit that flips the mode is usually the edit that adds the label groups, and `rt.settings`
+  // predates it — so arming off that snapshot answered `off` and the message was remembered and
+  // never classified. `boundObserverRuntime` cannot cover it: that agent is the inbox's responder,
+  // so it holds no observer row (issue #477 review, round 12).
+  test("a flip that also adds the taxonomy still arms the verdict", async () => {
+    await suDb.schedulerJob.deleteMany({
+      where: { tenantId, kind: "OBSERVE" },
+    });
+    await suDb.agent.update({
+      where: { id: agentDbId },
+      data: { mode: "production", settings: { debounce: { enabled: false } } },
+    });
+    const inbox = await suDb.inbox.findFirstOrThrow({
+      where: { tenantId, chatwootInboxId: INBOX_ID },
+      select: { id: true },
+    });
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        inboxId: inbox.id,
+        chatwootConversationId: 31,
+        contactInboxId: 81_031,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:31`,
+        lastEventAt: new Date(Date.now() - 60_000),
+      },
+    });
+    class FlippingModel extends FakeListChatModel {
+      override bindTools(): this {
+        return this;
+      }
+      override async _generate(
+        ...args: Parameters<FakeListChatModel["_generate"]>
+      ): ReturnType<FakeListChatModel["_generate"]> {
+        // The one edit: monitoring AND the taxonomy it is meant to classify into.
+        await suDb.agent.update({
+          where: { id: agentDbId },
+          data: {
+            mode: "monitoring",
+            settings: {
+              debounce: { enabled: false },
+              monitoring: {
+                labelGroups: [
+                  { name: "assunto", values: ["cancelamento", "outros"] },
+                ],
+              },
+            },
+          },
+        });
+        return super._generate(...args);
+      }
+    }
+    try {
+      deliverySeq += 1;
+      messageSeq += 1;
+      const n = normalizeChatwootEvent({
+        event: "message_created",
+        id: messageSeq,
+        private: false,
+        content: "quero cancelar",
+        message_type: "incoming",
+        sender: { id: 88, name: "Cliente", type: null },
+        conversation: conversation(31, {
+          assigneeType: null,
+          status: "pending",
+        }),
+      });
+      if (!n) throw new Error("payload did not normalize");
+      const delivery = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `mon-${process.pid}-${deliverySeq}`,
+          event: "message_created",
+          status: "PENDING",
+        },
+        select: { id: true },
+      });
+      await processChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryRowId: delivery.id,
+        agentBotId: OUR_BOT,
+        normalized: n,
+        base: appDb,
+        onDirectTurn: () => {},
+        deps: {
+          makeClient: (async () =>
+            ({
+              sendMessage: async () => ({}),
+              sendPrivateNote: async () => ({}),
+              toggleTyping: async () => ({}),
+              getConversationLabels: async () => [],
+              listLabels: async () => [],
+              listCustomAttributeDefinitions: async () => [],
+            }) as unknown as ChatwootClient) as never,
+          makeModel: () => new FlippingModel({ responses: ["oi"] }),
+        },
+      });
+      const armed = await suDb.schedulerJob.findMany({
+        where: { tenantId, kind: "OBSERVE" },
+        select: { payload: true },
+      });
+      expect(armed).toHaveLength(1);
+    } finally {
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
       await suDb.agent.update({
         where: { id: agentDbId },
         data: {

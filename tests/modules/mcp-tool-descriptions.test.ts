@@ -232,7 +232,17 @@ const SETTINGS_DESC_CEILING = 2_000;
 // native name is published on: `toolGuidance` and `toolPreconditions` carry one key per native, so
 // a native costs its name twice plus the precondition pattern — 393 characters, with no field of its
 // own anywhere in this schema. Re-measured on the tree that ships: 22,960.
-const SETTINGS_SCHEMA_CEILING = 23_000;
+//
+// RAISED again for issue #477, and the raise is again the decision the ceiling forces. The
+// `monitoring` block is what a watching agent DOES: an `analysis` enum, two small sub-objects, a
+// boolean, and `labelGroups` — an array of objects with a name, an `exclusive` flag and an array of
+// label titles. Trimming was tried first and taken as far as it goes: every `.describe()` in the
+// block is one clause, and the trim bought 360 characters, measured before the native above landed. What is left is the
+// shape — a nested block with an array of objects inside it costs more than its own sentences, the
+// way `takeover` above cost more than one boolean — and none of it is discretionary: a client that
+// cannot see `values` cannot write a group, and a group is the whole feature. Re-measured on the
+// tree that ships: 24,261. Headroom stays tighter than a block.
+const SETTINGS_SCHEMA_CEILING = 24_400;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -519,6 +529,58 @@ describe("MCP tool descriptions", () => {
     }
   });
 
+  //
+  // `inbox_observe` / `inbox_unobserve` (#476) are the two tools this branch adds. Each pays its
+  // whole description, and the first says what a caller cannot learn by trying — that only a
+  // monitoring agent may observe, that the inbox keeps starting conversations open for whoever
+  // answers it, and that the attach needs the fazer.ai Chatwoot. The second is one sentence,
+  // mirroring the first. REMEASURED on this base after the rebase over #543/#547/#548, never summed
+  // from the earlier reading: 30,417 and 55,351 on this tree, so the ceilings go to 30,432 and
+  // 55,367 — the same 15 and 16 the paragraphs above keep, so the next tool has to be measured too.
+  // The deltas came out the same across both rebases (+447 and +412), which is what a description
+  // that names its own tools rather than the tree around it should do.
+  //
+  // The `monitoring` block of `agent_settings_set` (#477) leaves the description total where it is —
+  // no tool added and no sentence beyond the block's own — and grows the schema side alone. The
+  // 1,321 is the shape and not the prose: `labelGroups` is an array of objects with a name, an
+  // `exclusive` flag and an array of titles, and a nested block with an array of objects inside it
+  // costs more than its own sentences, the way `takeover` cost more than one boolean. It is not
+  // discretionary either — a client that cannot see `values` cannot write a group, and a group is
+  // the whole feature. Round 23 then bounded the two strings' LENGTH, which publishes as `maxLength`
+  // on the name and on the value: 76 characters more, for a rule a client would otherwise learn by
+  // having its save refused. REMEASURED on this base after the rebase over #543/#547/#548, never
+  // summed from the earlier reading: 30,417 and 56,748 on this tree, so the ceilings are 30,432 and
+  // 56,764 — the description one is #476's, untouched, and the schema one keeps the same 16.
+  //
+  // RAISED to 56,976 by the `signature` block (#599), and remeasured the same way rather than summed:
+  // 212 characters for three fields, which is what a client needs to WRITE one — the two enums publish
+  // their values, and a client that cannot see `top`/`bottom` or `blank`/`--` cannot set them. The
+  // prose that would have explained the block (why it attaches to a chunk, which sends carry it, that
+  // markdown is not converted per channel) is in `docs/signature.md` instead, where it costs no
+  // tokens on every tools/list. The description total does not move: the block adds no paragraph.
+  //
+  // The first draft of the block had a fourth field, a `channels` allowlist, and it cost 331. It was
+  // dropped for a product reason rather than this one (docs/signature.md says why), and the ceiling
+  // came back down with it instead of being left as slack: a ratchet that keeps the headroom of a
+  // feature that shipped smaller is a ratchet that has stopped measuring.
+  //
+  // RAISED AGAIN to 57,043 by `signature.enabled` (#612), the block's fourth field. 51 characters for
+  // a boolean a client cannot otherwise discover, and without which an MCP client can only turn the
+  // signature off by deleting the operator's text, which is the loss the field exists to prevent.
+  // 57,027 measured, same 16 of headroom.
+  //
+  // RAISED AGAIN to 57,166 by `signature.frequency` (#616), the block's fifth field. 123 characters
+  // for an enum whose two values a client cannot guess and cannot otherwise discover — and the field
+  // is the one that decides whether the agent's name reaches every message of a split reply or only
+  // one of them, which is the question the first version of the block got wrong. The reasoning (why
+  // repetition is the same decision as position, and why the default is read off it) is in
+  // `docs/signature.md`, where it costs no tokens on every tools/list. 57,150 measured, same 16.
+  //
+  // RAISED AGAIN to 57,194 by `vision.extractionPrompt` becoming nullable (#622), 28 characters and no
+  // description. The reader honours null as "the default prompt" and the console sends exactly that on
+  // every Behavior save, so by this schema's own rule the value must parse; REST now asks this schema,
+  // and without the null the editor's own save would be refused on its first write. 57,178 measured,
+  // same 16.
   test("the whole tools/list payload stays under its ceiling", async () => {
     const all = await listed();
     let desc = 0;
@@ -527,8 +589,8 @@ describe("MCP tool descriptions", () => {
       desc += t.description.length;
       schema += t.schema.length;
     }
-    expect(desc).toBeLessThanOrEqual(29_985);
-    expect(schema).toBeLessThanOrEqual(54_955);
+    expect(desc).toBeLessThanOrEqual(30_432);
+    expect(schema).toBeLessThanOrEqual(57_194);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

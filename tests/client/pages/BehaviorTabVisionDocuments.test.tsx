@@ -10,6 +10,7 @@ import {
 } from "bun:test";
 import { cleanup, render, screen } from "@testing-library/react";
 import { BehaviorTab } from "@/client/pages/agents/BehaviorTab";
+import { observationToForm } from "@/client/pages/agents/observationFormState";
 import { readTtsFormState } from "@/client/pages/agents/ttsFormState";
 
 // Issue #324, second half: `openai` reads PDFs now, `openrouter` and `openai-compatible` still do
@@ -47,6 +48,8 @@ function renderWithProvider(
       followUpSteps: [],
     },
     agentId: "1",
+    agentName: "Recepção",
+    companyName: "Clínica Moreira",
     hours: [],
     businessHoursId: "",
     setBusinessHoursId: noop,
@@ -102,6 +105,14 @@ function renderWithProvider(
       maxDelayMs: "0",
     },
     setSplit: noop,
+    signature: {
+      enabled: false,
+      text: "",
+      position: "top" as const,
+      frequency: "all" as const,
+      separator: "blank" as const,
+    },
+    setSignature: () => {},
     vision: {
       enabled: true,
       provider,
@@ -122,6 +133,9 @@ function renderWithProvider(
       baseURL: "",
     },
     setMemory: noop,
+    mode: "production",
+    observation: observationToForm({}),
+    setObservation: noop,
     memoryCredBaseUrl: null,
     modelFallback: {
       provider: "",

@@ -12,6 +12,7 @@ import { isTestSilenced } from "@/modules/agents/test-mode";
 import { episodeTestActivatedAt } from "@/modules/channel-redirect/episode";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
+import { withConversationLabels } from "@/modules/chatwoot/labels";
 import {
   parseLiveConversation,
   shouldBotHandle,
@@ -37,6 +38,7 @@ import {
   buildTemplatePayload,
   proactiveSendMode,
 } from "@/modules/service-window/service";
+import { attachSignature, signatureFor } from "@/modules/signature/service";
 import {
   announceSpendCeiling,
   spendCeilingVerdict,
@@ -51,7 +53,7 @@ import {
   resolveGraphThreadId,
   threadBelongsToTenant,
 } from "./checkpointer";
-import { lastAssistantText } from "./graph";
+import { lastAssistantText, recursionLimitFor } from "./graph";
 import { owesHandbackNote } from "./handback";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { drainPendingIngest } from "./ingest-drain";
@@ -829,14 +831,24 @@ export async function runAgentNudge(
     const labels = actions.assignLabels?.filter((l) => l.trim());
     if (labels && labels.length > 0) {
       try {
-        const current = await client.getConversationLabels(conversationId);
-        // The GET is a Chatwoot round trip, so the answer above is about a moment before it. Same
-        // rule as the resolve below, and the labels need it for the same reason: /reset peels the
-        // episode's labels off on purpose, and a SET carrying the merged list puts them back on a
-        // conversation the operator was told had been cleared.
-        if (!(await stillWanted())) return "stale";
-        const merged = [...new Set([...current, ...labels])];
-        await client.setConversationLabels(conversationId, merged);
+        // Inside the conversation's label queue, with `set_labels` and the observer's verdict:
+        // the endpoint replaces the whole set (issue #477 review, round 3).
+        const stale = await withConversationLabels(
+          tenantId,
+          conversationId,
+          async () => {
+            const current = await client.getConversationLabels(conversationId);
+            // The GET is a Chatwoot round trip, so the answer above is about a moment before it.
+            // Same rule as the resolve below, and the labels need it for the same reason: /reset
+            // peels the episode's labels off on purpose, and a SET carrying the merged list puts
+            // them back on a conversation the operator was told had been cleared.
+            if (!(await stillWanted())) return true;
+            const merged = [...new Set([...current, ...labels])];
+            await client.setConversationLabels(conversationId, merged);
+            return false;
+          },
+        );
+        if (stale) return "stale";
       } catch (err) {
         logger.warn(
           { err, conversationId: String(conversationId) },
@@ -1001,7 +1013,7 @@ export async function runAgentNudge(
     // THE SAME SEAM THE REACTIVE TURN HANDS DOWN (issue #449), and this path needs it for the same
     // reason it needs the other fifteen asks: a nudge runs from a scheduler job, `/reset` retires
     // that job, and every ask above and below sits BETWEEN two steps. A tool call happens inside
-    // one, so a retirement landing while the model call is in flight left `assign_label` and
+    // one, so a retirement landing while the model call is in flight left `set_labels` and
     // `set_custom_attribute` free to write to the conversation the operator just cleared.
     //
     // Always present (issue #209 review, round 5): the local helper also reads the switch and the
@@ -1094,6 +1106,9 @@ export async function runAgentNudge(
     tools,
   });
   const invokeConfig = {
+    // LangGraph counts SUPER-STEPS and its default 25 runs out at about twelve tool rounds, so a
+    // budget the operator is allowed to set (1-50) would throw instead of ending at the budget.
+    recursionLimit: recursionLimitFor(cfg.maxToolCalls),
     configurable: { thread_id: graphThreadId },
     callbacks,
   };
@@ -1148,6 +1163,25 @@ export async function runAgentNudge(
   // Returns the whole decision, not just the text. What follows a screening on this path depends on
   // whether a judge ran at all and on whether it wrote anything down, and those are questions only
   // the decision answers.
+
+  // THE SAME SIGNATURE THE REACTIVE TURN APPLIES, through the same function (issue #599). Both sends
+  // below close a turn the customer will read — the handoff's closing line and the proactive message
+  // itself — and the farewell in particular is the SAME sentence `deliverText` signs on the reactive
+  // path. Signed there and bare here is the inconsistency an operator reports as a bug.
+  //
+  // A one-element array because this path sends one message: `attachSignature` is the single
+  // spelling of the rule, and "split off" is not a second rule about signatures, it is one chunk.
+  const sign = (text: string): string => {
+    const sig = signatureFor(
+      cfg.signatureConfig,
+      cfg.promptVars,
+      cfg.promptOpts,
+    );
+    if (!sig) return text;
+    const [out = text] = attachSignature([text], sig, cfg.signatureConfig);
+    return out;
+  };
+
   const screenOutput = (text: string): Promise<GuardrailDecision> =>
     buildGuardrailGate({
       cfg: cfg.guardrails,
@@ -1206,7 +1240,7 @@ export async function runAgentNudge(
       // both answers above it are spent by the time it returns. The reply branch does exactly this.
       if (!(await stillWanted())) return "stale";
       if (sendModeNow() !== "freeform") return await noteOutsideWindow();
-      await client.sendMessage(conversationId, line2);
+      await client.sendMessage(conversationId, sign(line2));
       logger.info(
         "agentNudge handed off: conv=%s source=%s",
         String(conversationId),
@@ -1876,7 +1910,7 @@ export async function runAgentNudge(
     // where the reply can still fall through to the template/note branch below instead of being
     // lost to that rejection — on the handoff path, permanently.
     if (canMessagePost && sendModeNow() === "freeform") {
-      await client.sendMessage(conversationId, screened);
+      await client.sendMessage(conversationId, sign(screened));
       logger.info(
         "agentNudge messaged: conv=%s source=%s",
         String(conversationId),

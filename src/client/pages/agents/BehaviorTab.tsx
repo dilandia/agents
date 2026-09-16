@@ -3,6 +3,7 @@ import {
   ArrowRightLeft,
   Brain,
   CalendarClock,
+  Eye,
   Gauge,
   Image,
   ImagePlus,
@@ -11,6 +12,7 @@ import {
   ListChecks,
   Megaphone,
   Mic,
+  PenLine,
   Plus,
   Scissors,
   ScrollText,
@@ -19,7 +21,7 @@ import {
   UserRoundCheck,
   Volume2,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
@@ -36,6 +38,7 @@ import {
   SwitchField,
   Textarea,
 } from "@/client/components";
+import { Markdown } from "@/client/components/Markdown";
 import { api } from "@/client/lib/api";
 import { credentialCompat } from "@/client/lib/credentialCompat";
 import {
@@ -51,8 +54,20 @@ import { isValidHttpUrl } from "@/client/lib/validation";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import {
+  buildPromptVars,
+  interpolatePromptVars,
+  PROMPT_CONTEXT_VARS,
+  PROMPT_PREVIEW_AGENT,
+  PROMPT_PREVIEW_COMPANY,
+  PROMPT_PREVIEW_CONTACT,
+  type PromptRenderOpts,
+} from "@/graph/prompt";
+import { clipText } from "@/lib/text";
+import type { AgentMode } from "@/modules/agents/mode";
+import {
   EXTRACTION_PROMPT_MAX,
   FOLLOW_UP_INSTRUCTIONS_MAX,
+  SIGNATURE_MAX,
   TEMPLATE_MESSAGE_MAX,
 } from "@/modules/agents/text-caps";
 import { formatWindowsSummary } from "@/modules/business-hours/announce";
@@ -66,6 +81,7 @@ import {
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import { visionAcceptsDocuments } from "@/modules/vision/document-support";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
+import { HighlightedPromptEditor } from "./HighlightedPromptEditor";
 import {
   fallbackIsConfigured,
   fallbackModelIsMissing,
@@ -78,7 +94,10 @@ import {
   overridePickerSource,
   overrideProviderChanged,
 } from "./modelOverrideForm";
+import { ObservationSection } from "./ObservationSection";
+import type { ObservationState } from "./observationFormState";
 import { Section, SectionNav } from "./SectionNav";
+import { signatureOnToggle } from "./signatureFormState";
 import { TabActionBar } from "./TabActionBar";
 import {
   type TtsFormState,
@@ -174,6 +193,99 @@ interface SplitState {
   maxDelayMs: string;
 }
 
+// The operator's closing line (issue #599), mirroring modules/signature. One text, on every channel
+// the agent answers on, and an empty text is the off switch.
+//
+// The bytes the customer receives, built by the SAME rule the runtime applies (modules/signature:
+// blank is two newlines, `--` is two newlines around a `--` line). An operator who has to guess what
+// "separator" means reads it here instead.
+//
+// RENDERED, not shown raw, and that is the point of having it. The field is a plain textarea rather
+// than a rich editor, so `**Gi**` is what the operator types; the preview is the only place that
+// answers whether it lands as bold or as four asterisks. It renders through the same <Markdown> the
+// conversation view and the playground use, which is what a channel that understands Markdown does
+// with it — on one that does not, the characters go out as typed (#603, and the field's own hint).
+// THROUGH `buildPromptVars`, not a hand-written map, so the example context cannot fall behind the
+// chips: it was written by hand first and omitted `{{email_contato}}`, `{{telefone_contato}}` and
+// `{{canal}}`, which the chips offer — so the preview rendered three supported variables as literal
+// text and taught the operator they do not work. Review of #599. The names come from the same
+// function production builds them with, so a variable added there appears here without anyone
+// remembering to.
+//
+// The CONTACT is an example, and the preview says so; the agent and the company are the operator's
+// OWN, the way the prompt editor already renders them. A signature is mostly those two names, so a
+// preview that shows somebody else's is a preview of a message the operator will never send — the
+// acceptance run put it plainly: "o operador que olha a prévia vê um nome de exemplo, não o dele".
+// The generic stand-ins survive for what the editor cannot know yet: an agent still being named,
+// and a tenant with no company name set.
+export function signaturePreviewVars(
+  agentName?: string | null,
+  companyName?: string | null,
+): Record<string, string> {
+  return buildPromptVars({
+    agentName: agentName?.trim() || PROMPT_PREVIEW_AGENT,
+    companyName: companyName?.trim() || PROMPT_PREVIEW_COMPANY,
+    ...PROMPT_PREVIEW_CONTACT,
+  });
+}
+
+// THE OPTIONS, not only the variables, because `interpolatePromptVars` answers a schedule name from
+// `opts.availability` and a time name from `opts.now`/`opts.timezone`. Passing the map alone left
+// `{{horario_atendimento}}` literal in the preview while production rendered the real hours — the
+// third finding in this family, after the map itself was completed and after the live path got its
+// options. `tests/client/signature-preview-vars.test.ts` now fences the whole set rather than the
+// name that happened to be reported.
+//
+// The schedule is the operator's OWN, looked up from the Availability the agent is on, so the
+// preview shows the hours they configured instead of a plausible fake. No Availability means
+// `schedule: null`, which is what production passes and what the gate reads as always on.
+// ONE ARRAY PER MESSAGE, since #616, because repetition is the thing being previewed and a preview
+// of one balloon cannot show it. It also makes `once` legible for the first time: the operator sees
+// WHICH of the two messages carries the signature, which is the half of the old rule nobody could
+// read off a single bubble.
+//
+// The message count follows the SPLIT, not the frequency: with the split off the agent sends one
+// message and the two frequencies are the same thing, so showing two balloons there would preview
+// a delivery that never happens.
+export function signaturePreviewParts(
+  sig: SignatureState,
+  t: (k: string, d: string) => string,
+  vars: Record<string, string>,
+  opts: PromptRenderOpts = {},
+  splitOn = true,
+): string[][] {
+  // Interpolated like the signature itself, so the example name in the body and the one a
+  // `{{nome_contato}}` in the signature resolves to are the SAME person. A preview that greets Ana
+  // and signs off to somebody else teaches the operator the variables do not work.
+  const bodies = [
+    t("editor.signaturePreviewBody", "Hi {{primeiro_nome}}, all set here."),
+    ...(splitOn
+      ? [t("editor.signaturePreviewBody2", "Any questions, just ask.")]
+      : []),
+  ].map((b) => interpolatePromptVars(b, vars, opts));
+  // Through the RUNTIME's own interpolation, not a second copy of it: what the preview shows and
+  // what the customer receives have to be the same function, including the rule that an unknown
+  // placeholder is left standing instead of blanked, which is how a typo stays visible here.
+  const text = interpolatePromptVars(sig.text.trim(), vars, opts);
+  if (!text) return bodies.map((b) => [b]);
+  // The same index `attachSignature` picks, spelled once: every message with `all`, otherwise the
+  // first with `top` and the last with `bottom`.
+  const signedAt = (i: number): boolean =>
+    sig.frequency === "all" ||
+    (sig.position === "top" ? i === 0 : i === bodies.length - 1);
+  return bodies.map((b, i) =>
+    signedAt(i) ? (sig.position === "top" ? [text, b] : [b, text]) : [b],
+  );
+}
+
+export interface SignatureState {
+  enabled: boolean;
+  text: string;
+  position: "top" | "bottom";
+  frequency: "all" | "once";
+  separator: "blank" | "--";
+}
+
 interface VisionState {
   enabled: boolean;
   provider: string;
@@ -257,6 +369,14 @@ export interface FollowUpState {
 
 interface BehaviorTabProps {
   agentId: string;
+  // The name being edited on General, live, so the signature preview signs with the operator's own
+  // agent instead of a stand-in. Empty while a new agent is still unnamed.
+  agentName: string;
+  // The active tenant's display name, RESOLVED BY THE PAGE rather than by a hook in here. Reaching
+  // for `useActiveTenantName()` from this tab made it unrenderable without an AuthProvider, which
+  // the full suite hid (an earlier file leaves the context standing) and a sharded CI run would not.
+  // Null while it is still resolving, or when a fleet session has nothing selected.
+  companyName: string | null;
   // The refused input this tab draws, if the standing refusal is about one of them. Read in
   // AgentEditorPage and passed as answers -- see the note on the type.
   refusals: BehaviorRefusals;
@@ -288,12 +408,19 @@ interface BehaviorTabProps {
   ttsNormalizeCredBaseUrl: string | null;
   split: SplitState;
   setSplit: React.Dispatch<React.SetStateAction<SplitState>>;
+  signature: SignatureState;
+  setSignature: React.Dispatch<React.SetStateAction<SignatureState>>;
   vision: VisionState;
   setVision: React.Dispatch<React.SetStateAction<VisionState>>;
   visionCredBaseUrl: string | null;
   limits: LimitsState;
   memory: MemoryState;
   setMemory: React.Dispatch<React.SetStateAction<MemoryState>>;
+  // The agent's mode decides which sections are drawn (issue #494): a watcher never answers, so
+  // the sections that configure how it answers are hidden, and the Observation block appears.
+  mode: AgentMode;
+  observation: ObservationState;
+  setObservation: React.Dispatch<React.SetStateAction<ObservationState>>;
   modelFallback: ModelFallbackState;
   setModelFallback: React.Dispatch<React.SetStateAction<ModelFallbackState>>;
   modelFallbackCredBaseUrl: string | null;
@@ -334,7 +461,9 @@ interface BehaviorTabProps {
   saving: boolean;
   onSave: () => void;
   onDiscard: () => void;
-  onOpenPlayground: () => void;
+  // Absent for a watcher (issue #494): the bar then shows no playground entry, the way the tab
+  // itself is not drawn for one.
+  onOpenPlayground?: () => void;
 }
 
 function toScheduleOption(h: Hours): ScheduleOption {
@@ -686,10 +815,14 @@ function AttributeContextPickers({
 function ContactAuthTeamSelect({
   agentId,
   value,
+  instanceId: storedInstanceId,
   onChange,
 }: {
   agentId: string;
   value: string;
+  // The account the stored team was picked in, as recorded next to it. Empty for a value written
+  // before the field existed, or through REST/MCP without it.
+  instanceId: string;
   // The team AND the account it came from: stored together, because the id alone means nothing
   // outside it.
   onChange: (teamId: string, instanceId: string) => void;
@@ -697,9 +830,12 @@ function ContactAuthTeamSelect({
   const { t } = useTranslation();
   const [data, setData] = useState<{
     teams: Array<{ id: number; name: string }>;
-    accountCount: number;
-    // Our ChatwootInstance id of the single account, when there is exactly one.
-    instanceId: string;
+    // Every account the agent serves, so a stored target can be checked against the one it names.
+    accounts: Array<{
+      instanceId: string;
+      accountId: number;
+      accountName: string | null;
+    }>;
   } | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -711,16 +847,12 @@ function ContactAuthTeamSelect({
         if (!cancelled) {
           setData(
             d
-              ? {
-                  teams: d.teams,
-                  accountCount: d.accounts.length,
-                  instanceId: d.accounts[0]?.instanceId ?? "",
-                }
-              : { teams: [], accountCount: 0, instanceId: "" },
+              ? { teams: d.teams, accounts: d.accounts }
+              : { teams: [], accounts: [] },
           );
         }
       } catch {
-        if (!cancelled) setData({ teams: [], accountCount: 0, instanceId: "" });
+        if (!cancelled) setData({ teams: [], accounts: [] });
       }
     })();
     return () => {
@@ -728,20 +860,32 @@ function ContactAuthTeamSelect({
     };
   }, [agentId]);
   const teams = data?.teams ?? [];
+  const accounts = data?.accounts ?? [];
   const listed = teams.some((tm) => String(tm.id) === value);
   // Populated only when the agent serves exactly one account, which is the only case the picker
   // offers teams in.
-  const instanceId = data?.accountCount === 1 ? data.instanceId : "";
-  // A Chatwoot team id means something inside ONE account. When the agent serves several, the
-  // listing deliberately comes back empty, and keeping the stored id as a "(not listed)" option
-  // re-saved a target that the runtime then applies through EVERY account's client: in the other
-  // accounts that number is a different team or none, so refused contacts are routed nowhere.
-  // Cleared here rather than at save time, so the operator sees the field empty and the warning
-  // saying why, and still has to press save.
-  const multiAccount = data !== null && data.accountCount > 1;
+  const instanceId =
+    accounts.length === 1 ? (accounts[0]?.instanceId ?? "") : "";
+  // A Chatwoot team id means something inside ONE account, so what makes a stored target usable is
+  // the ACCOUNT RECORDED NEXT TO IT — the same rule the runtime applies per conversation
+  // (`teamTargetUsable` in modules/chatwoot/webhook.ts): the recorded account decides, and counting
+  // accounts is only the fallback for a value stored before that field existed. Judging by the count
+  // alone, as this did, threw away a target the runtime would have used: an agent bound to one inbox
+  // per account (a test inbox beside the live one) had its team wiped just by opening this tab, and
+  // the write marked the tab unsaved on top of it.
+  const storedAccount = accounts.find((a) => a.instanceId === storedInstanceId);
+  const storedUsable = storedInstanceId
+    ? !!storedAccount
+    : accounts.length === 1;
+  // Only judge once the listing came back with accounts. Zero means no inbox is bound yet (or the
+  // read failed), which says nothing about the target and must not cost the operator their choice.
+  const judged = accounts.length > 0;
+  const drop = judged && !!value && !storedUsable;
   useEffect(() => {
-    if (multiAccount && value) onChange("", "");
-  }, [multiAccount, value, onChange]);
+    if (drop) onChange("", "");
+  }, [drop, onChange]);
+  const keptElsewhere =
+    judged && !!value && storedUsable && accounts.length > 1;
   return (
     <FormField
       label={t("editor.contactAuthTeam", "Assign to team")}
@@ -760,7 +904,7 @@ function ContactAuthTeamSelect({
           <option value="">
             {t("editor.contactAuthNoTeam", "No team (inbox routing)")}
           </option>
-          {!listed && value && !multiAccount && (
+          {!listed && value && !drop && (
             <option value={value}>
               {t("editor.contactAuthTeamStored", "Team #{{id}} (not listed)", {
                 id: value,
@@ -773,17 +917,27 @@ function ContactAuthTeamSelect({
             </option>
           ))}
         </Select>
-        {data && data.accountCount !== 1 && (
+        {data && accounts.length !== 1 && (
           <span className="text-text-muted text-xs">
-            {data.accountCount === 0
+            {accounts.length === 0
               ? t(
                   "editor.handoffPinnedNoInbox",
                   "Bind at least one inbox in the Channels tab first.",
                 )
-              : t(
-                  "editor.contactAuthTeamMultiAccount",
-                  "This agent serves more than one Chatwoot account. A team id belongs to one account, so no team can be targeted here — Chatwoot's inbox routing decides who takes a refused conversation.",
-                )}
+              : keptElsewhere
+                ? t(
+                    "editor.contactAuthTeamKept",
+                    "This agent serves more than one Chatwoot account, so teams cannot be listed here. The saved team belongs to {{account}} and is applied only to conversations in that account; elsewhere Chatwoot's inbox routing decides.",
+                    {
+                      account:
+                        storedAccount?.accountName ??
+                        `#${storedAccount?.accountId}`,
+                    },
+                  )
+                : t(
+                    "editor.contactAuthTeamMultiAccount",
+                    "This agent serves more than one Chatwoot account. A team id belongs to one account, so no team can be targeted here — Chatwoot's inbox routing decides who takes a refused conversation.",
+                  )}
           </span>
         )}
       </div>
@@ -993,8 +1147,44 @@ function FollowUpStepsEditor({
   );
 }
 
+// What a WATCHER's Behavior tab shows. It used to be a short list, because a monitoring agent ran
+// one model call and wrote labels: everything about ANSWERING was hidden, and so was everything a
+// classifier had no use for. A watcher now runs the ordinary graph (issue #568), so the rule is a
+// different one — hide what is about SPEAKING TO THE CUSTOMER, show everything else, because
+// everything else runs.
+//
+// Hidden, therefore: availability and the away message (when it answers), grouping (the responder's
+// debounce; a watcher has its own burst window on Observation), audio, splitting, images,
+// contact authorization, takeover and the proactive ladder. Each of those either decides how a reply
+// goes out or gates one, and a watcher has no reply.
+//
+// Shown, and new here: DATA IN CONTEXT, which builds a prompt block on every turn including this
+// one, and EXECUTION LIMITS, which bound the tool calls a watcher now actually makes.
+//
+// Hidden, not unmounted (`Section.hidden`): the form keeps its state, and flipping the mode back
+// shows it again untouched.
+export const MONITORING_SECTIONS: ReadonlySet<string> = new Set([
+  "observation",
+  "memory",
+  "observability",
+  "modelFallback",
+  "attributeContext",
+  "limits",
+  // NOTE: STT AND VISION RUN FOR A WATCHER (issue #494 review, round 2), so their controls have to
+  // be reachable. The receiver's `watcherReads` path runs `runEagerMedia` under the OBSERVER's own
+  // settings whenever that route is the one that will remember the message — an observer on an inbox
+  // with no responder is exactly that — and a watcher that remembers an audio as an attachment
+  // marker instead of its transcription remembers nothing of it. Hidden here, together with their
+  // configuration warnings, the operator could neither switch them on nor repair a broken
+  // credential, and audio, images and documents reached observation with nothing extracted.
+  "stt",
+  "vision",
+]);
+
 export function BehaviorTab({
   agentId,
+  agentName,
+  companyName,
   refusals,
   hours,
   businessHoursId,
@@ -1021,12 +1211,17 @@ export function BehaviorTab({
   ttsNormalizeCredBaseUrl,
   split,
   setSplit,
+  signature,
+  setSignature,
   vision,
   setVision,
   visionCredBaseUrl,
   limits,
   memory,
   setMemory,
+  mode,
+  observation,
+  setObservation,
   modelFallback,
   setModelFallback,
   modelFallbackCredBaseUrl,
@@ -1055,6 +1250,88 @@ export function BehaviorTab({
   onOpenPlayground,
 }: BehaviorTabProps) {
   const { t, i18n } = useTranslation();
+
+  // The signature's "insert variable" helper, the same affordance the prompt editor has and for the
+  // same reason: `{{nome_agente}}` is only useful to someone who knows it exists, and a chip that
+  // writes it at the caret is how they find out. `HighlightedPromptEditor` forwards its ref to the
+  // inner <textarea> precisely so this works.
+  //
+  // CONTEXT VARS ONLY, not the prompt's whole list. The time and schedule names interpolate here too
+  // (it is the same function), but a closing line that announces the current minute is not a
+  // signature, and offering it invites a signature that changes on every message — which is the one
+  // property this feature exists to remove.
+  const signatureRef = useRef<HTMLTextAreaElement>(null);
+  // How much a SELECTION would free, since an insert REPLACES it. Tracked in state because the
+  // chips' disabled state is decided at render and a selection change does not otherwise cause one:
+  // without it a chip stays greyed out while the very text it would overwrite sits highlighted.
+  const [signatureSelected, setSignatureSelected] = useState(0);
+  const readSignatureSelection = useCallback(() => {
+    const el = signatureRef.current;
+    if (!el) return;
+    setSignatureSelected(
+      Math.max(0, (el.selectionEnd ?? 0) - (el.selectionStart ?? 0)),
+    );
+  }, []);
+  // What is left before the cap. A chip whose token does not fit is DISABLED rather than clipped:
+  // clipping an insert cuts the TAIL of what the operator already wrote, which is the one thing a
+  // helper button must never do — the caret is at the front, the loss is at the back, and nothing
+  // on screen connects the two. Found in review of #599.
+  const signatureRoom =
+    SIGNATURE_MAX - signature.text.length + signatureSelected;
+  // The agent's own Availability, so a `{{horario_atendimento}}` in the signature previews the hours
+  // the operator configured rather than a plausible fake. `null` when none is picked, which is what
+  // production passes and what the gate reads as always on.
+  const signaturePreviewSchedule =
+    hours.find((h) => String(h.id) === businessHoursId) ?? null;
+  const signaturePreviewOpts: PromptRenderOpts = {
+    availability: {
+      schedule: signaturePreviewSchedule
+        ? (toScheduleOption(signaturePreviewSchedule) as unknown as NonNullable<
+            NonNullable<PromptRenderOpts["availability"]>["schedule"]
+          >)
+        : null,
+    },
+  };
+  // Live on both names: the one being typed on General, and the tenant's, through the same hook the
+  // prompt editor's preview reads. A signature is mostly those two, so previewing a stand-in
+  // previews a message the operator never sends.
+  const signatureVars = signaturePreviewVars(agentName, companyName);
+  const signatureVarsBlocked = PROMPT_CONTEXT_VARS.some(
+    (v) => `{{${v}}}`.length > signatureRoom,
+  );
+  function insertSignatureVar(name: string) {
+    const token = `{{${name}}}`;
+    // Asked here too, not only on the button, and against the LIVE selection rather than the tracked
+    // one: the guard has to hold whatever reaches this, including a selection the render has not
+    // seen yet.
+    const el0 = signatureRef.current;
+    const selected = el0
+      ? Math.max(0, (el0.selectionEnd ?? 0) - (el0.selectionStart ?? 0))
+      : signatureSelected;
+    if (token.length > SIGNATURE_MAX - signature.text.length + selected) return;
+    const el = signatureRef.current;
+    if (!el) {
+      setSignature((sg) => ({
+        ...sg,
+        text: clipText(sg.text + token, SIGNATURE_MAX),
+      }));
+      return;
+    }
+    // A caret index, not a cap: `selectionStart` is a position the browser maintains and it never
+    // sits between the two halves of an astral character, which is why this cut is bare and the two
+    // that bound the value are not (tests/lib/astral-cap-sweep.test.ts).
+    const start = el.selectionStart ?? signature.text.length;
+    const end = el.selectionEnd ?? signature.text.length;
+    const next =
+      signature.text.slice(0, start) + token + signature.text.slice(end);
+    setSignature({ ...signature, text: clipText(next, SIGNATURE_MAX) });
+    setSignatureSelected(0);
+    requestAnimationFrame(() => {
+      el.focus();
+      const pos = start + token.length;
+      el.setSelectionRange(pos, pos);
+    });
+  }
 
   // NOTE: the `enabled` guards are load-bearing, not defensive. Each block is HIDDEN when its
   // feature is off, so a leftover openai-compatible provider with no endpoint would disable Save for
@@ -1315,6 +1592,11 @@ export function BehaviorTab({
       label: t("editor.split", "Reply in multiple messages"),
     },
     {
+      id: "signature",
+      icon: PenLine,
+      label: t("editor.signature", "Signature"),
+    },
+    {
       id: "attributeContext",
       icon: ListChecks,
       label: t("editor.attributeContext", "Data in context"),
@@ -1364,13 +1646,32 @@ export function BehaviorTab({
     },
   ];
 
+  const watcher = mode === "monitoring";
+  const visibleSections = watcher
+    ? [
+        {
+          id: "observation",
+          icon: Eye,
+          label: t("editor.observation", "Observation"),
+        },
+        ...sections.filter((s) => MONITORING_SECTIONS.has(s.id)),
+      ]
+    : sections;
+
   return (
     <div className="flex grow flex-col gap-4">
       <div className="flex gap-6">
-        <SectionNav sections={sections} />
+        <SectionNav sections={visibleSections} />
         <div className="flex min-w-0 grow flex-col gap-4">
+          {watcher && (
+            <ObservationSection
+              observation={observation}
+              setObservation={setObservation}
+            />
+          )}
           <Section
             id="availability"
+            hidden={watcher}
             icon={CalendarClock}
             title={t("editor.availability", "Availability")}
             description={t(
@@ -1426,6 +1727,7 @@ export function BehaviorTab({
 
           <Section
             id="debounce"
+            hidden={watcher}
             icon={Layers}
             title={t("editor.debounce", "Message grouping (debounce)")}
             description={t(
@@ -1810,6 +2112,7 @@ export function BehaviorTab({
 
           <Section
             id="tts"
+            hidden={watcher}
             icon={Volume2}
             title={t("editor.tts", "Audio replies (text-to-speech)")}
             description={t(
@@ -2229,6 +2532,7 @@ export function BehaviorTab({
 
           <Section
             id="split"
+            hidden={watcher}
             icon={Scissors}
             title={t("editor.split", "Reply in multiple messages")}
             description={t(
@@ -2303,6 +2607,225 @@ export function BehaviorTab({
           </Section>
 
           <Section
+            id="signature"
+            hidden={watcher}
+            icon={PenLine}
+            title={t("editor.signature", "Signature")}
+            description={t(
+              "editor.signatureHint",
+              "A line you write once, added to the agent's messages. Asked for in the prompt instead, it comes out differently every time and never on a handoff.",
+            )}
+            help={t(
+              "editor.signatureHelp",
+              "The signature goes on the agent's reply and on a handoff's farewell, never on a private note or an audio reply. A long reply arrives as more than one message: above it the signature is a badge, and a badge belongs on every one; below it is a farewell, and a farewell is said once.\n\nWrite Markdown and Chatwoot converts it per channel on the way out: **bold** reaches WhatsApp as *bold* and e-mail as bold text. A link keeps its label on e-mail and loses it on WhatsApp, where only the address goes, so write the address bare if the agent answers there.\n\nOnce this is set, the prompt should say nothing about signing. A prompt that still asks for a closing produces a second, slightly different one that no check can catch.",
+            )}
+          >
+            <SwitchField
+              checked={signature.enabled}
+              // Through the pair, not a second copy of the rule here: what the toggle does to the
+              // text is a decision (seed an empty box, never touch a kept one) and it belongs where
+              // a test can reach it.
+              onCheckedChange={(v) =>
+                setSignature(signatureOnToggle(signature, v))
+              }
+              label={t(
+                "editor.signatureEnabled",
+                "Add a signature to the agent's messages",
+              )}
+            />
+            {signature.enabled && (
+              <>
+                <FormField
+                  label={t("editor.signatureText", "Signature")}
+                  description={t(
+                    "editor.signatureTextHint",
+                    "Takes the same {{variables}} as the system prompt, and Markdown for **bold** and _italic_, which Chatwoot converts per channel.",
+                  )}
+                >
+                  <HighlightedPromptEditor
+                    ref={signatureRef}
+                    rows={3}
+                    maxLength={SIGNATURE_MAX}
+                    onSelect={readSignatureSelection}
+                    value={signature.text}
+                    onChange={(v) =>
+                      setSignature({
+                        ...signature,
+                        text: clipText(v, SIGNATURE_MAX),
+                      })
+                    }
+                    aria-label={t("editor.signatureText", "Signature")}
+                  />
+                  <div className="mt-1.5 flex flex-col gap-1.5">
+                    <span className="text-text-muted text-xs">
+                      {t("editor.signatureVarsHint", "Insert a variable:")}
+                      {/* INLINE, not a tooltip on the disabled button. A native `title` is unreachable
+                      by keyboard (a disabled button takes no focus) and by touch, so the one state
+                      that needs explaining would explain itself only to a mouse. This is outcome 2
+                      in docs/ui.md: the app can tell the limit now applies, so it says so, at that
+                      moment, and goes away again on its own. */}
+                      {signatureVarsBlocked && (
+                        <span className="ml-1 text-warning">
+                          {t(
+                            "editor.signatureVarNoRoom",
+                            "Not enough room left before the limit.",
+                          )}
+                        </span>
+                      )}
+                    </span>
+                    <div className="flex flex-wrap gap-1.5">
+                      {PROMPT_CONTEXT_VARS.map((v) => {
+                        const fits = `{{${v}}}`.length <= signatureRoom;
+                        return (
+                          <button
+                            key={v}
+                            type="button"
+                            disabled={!fits}
+                            onClick={() => insertSignatureVar(v)}
+                            className="rounded border border-border bg-bg-tertiary px-1.5 py-0.5 font-mono text-text-secondary text-xs hover:bg-bg-hover hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-bg-tertiary disabled:hover:text-text-secondary"
+                          >
+                            {`{{${v}}}`}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </FormField>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField
+                    label={t("editor.signaturePosition", "Position")}
+                    description={t(
+                      "editor.signaturePositionHint",
+                      "Where it goes in the message.",
+                    )}
+                  >
+                    <Select
+                      value={signature.position}
+                      onChange={(e) =>
+                        setSignature({
+                          ...signature,
+                          position: e.target.value as "top" | "bottom",
+                        })
+                      }
+                    >
+                      <option value="top">
+                        {t("editor.signatureTop", "Above the message")}
+                      </option>
+                      <option value="bottom">
+                        {t("editor.signatureBottom", "Below the message")}
+                      </option>
+                    </Select>
+                  </FormField>
+                  <FormField
+                    label={t("editor.signatureFrequency", "Which messages")}
+                    description={t(
+                      "editor.signatureFrequencyHint",
+                      "A reply can arrive as more than one message. This says whether the signature repeats on each of them.",
+                    )}
+                  >
+                    <Select
+                      value={signature.frequency}
+                      onChange={(e) =>
+                        setSignature({
+                          ...signature,
+                          frequency: e.target.value as "all" | "once",
+                        })
+                      }
+                    >
+                      <option value="all">
+                        {t("editor.signatureFreqAll", "On every message")}
+                      </option>
+                      {/* THE LABEL FOLLOWS THE POSITION, because "one of them" is not an answer on
+                      its own: with the signature above the message it is the FIRST, below it the
+                      LAST, and an operator reading "only once" has to guess which. Changing the
+                      position rewrites this label and leaves the SELECTION alone — the two fields
+                      are independent, and a badge only on the opening balloon is a real choice. */}
+                      <option value="once">
+                        {signature.position === "top"
+                          ? t(
+                              "editor.signatureFreqFirst",
+                              "Only on the first message",
+                            )
+                          : t(
+                              "editor.signatureFreqLast",
+                              "Only on the last message",
+                            )}
+                      </option>
+                    </Select>
+                  </FormField>
+                  <FormField
+                    label={t("editor.signatureSeparator", "Separator")}
+                    description={t(
+                      "editor.signatureSeparatorHint",
+                      "What sits between the message and the signature.",
+                    )}
+                  >
+                    <Select
+                      value={signature.separator}
+                      onChange={(e) =>
+                        setSignature({
+                          ...signature,
+                          separator: e.target.value as "blank" | "--",
+                        })
+                      }
+                    >
+                      <option value="blank">
+                        {t("editor.signatureSepBlank", "A blank line")}
+                      </option>
+                      <option value="--">
+                        {t("editor.signatureSepDashes", "A blank line and --")}
+                      </option>
+                    </Select>
+                  </FormField>
+                </div>
+                <FormField
+                  label={t("editor.signaturePreview", "Preview")}
+                  description={t(
+                    "editor.signaturePreviewHint",
+                    "An example reply, as the customer receives it. Your agent and company names are the real ones; the contact details are examples.",
+                  )}
+                >
+                  {/* ONE bubble with the separator drawn inside it, not a single Markdown string.
+                  Rendering the whole thing at once made `blank` and `--` look almost alike: a blank
+                  line between two paragraphs came out as Markdown's own paragraph gap, which is
+                  smaller than a line and reads as ordinary spacing rather than as the choice the
+                  operator just made. Splitting at the separator is also what the bytes are. */}
+                  <div className="flex flex-col gap-2">
+                    {signaturePreviewParts(
+                      signature,
+                      t,
+                      signatureVars,
+                      signaturePreviewOpts,
+                      split.enabled,
+                    ).map((parts) => (
+                      <div
+                        key={parts.join("\u0000")}
+                        className="rounded-lg border border-border bg-bg-tertiary px-3 py-2"
+                      >
+                        {parts.map((part, i) => (
+                          <div key={part}>
+                            {i > 0 &&
+                              (signature.separator === "--" ? (
+                                <div className="py-1 font-mono text-sm text-text-secondary">
+                                  {/* Not translatable: these are the bytes the separator puts on
+                                  the wire, the same two `DELIMITERS` writes. */}
+                                  {"--"}
+                                </div>
+                              ) : (
+                                <div className="h-5" aria-hidden="true" />
+                              ))}
+                            <Markdown>{part}</Markdown>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </FormField>
+              </>
+            )}
+          </Section>
+
+          <Section
             id="attributeContext"
             icon={ListChecks}
             title={t("editor.attributeContext", "Data in context")}
@@ -2320,6 +2843,7 @@ export function BehaviorTab({
 
           <Section
             id="sendImage"
+            hidden={watcher}
             icon={ImagePlus}
             title={t("editor.sendImage", "Sending images")}
             help={t(
@@ -2345,6 +2869,7 @@ export function BehaviorTab({
 
           <Section
             id="contactAuth"
+            hidden={watcher}
             icon={ShieldCheck}
             title={t("editor.contactAuth", "Contact authorization")}
             help={t(
@@ -2568,6 +3093,7 @@ export function BehaviorTab({
                   <ContactAuthTeamSelect
                     agentId={agentId}
                     value={contactAuth.handoffTeamId}
+                    instanceId={contactAuth.handoffTeamInstanceId}
                     onChange={(v, instanceId) =>
                       setContactAuth({
                         ...contactAuth,
@@ -2585,6 +3111,7 @@ export function BehaviorTab({
 
           <Section
             id="takeover"
+            hidden={watcher}
             icon={UserRoundCheck}
             title={t("editor.takeover", "When a person answers")}
             help={t(
@@ -2635,10 +3162,25 @@ export function BehaviorTab({
                   "editor.limitsMaxHistoryTokensHint",
                   "Empty means no ceiling. Between 2,000 and 1,000,000.",
                 )}
-                help={t(
-                  "editor.limitsMaxHistoryTokensHelp",
-                  "The agent sends this contact's whole history on every turn. The more a customer talks, the slower and costlier their answers get.\n\nThe ceiling cuts that off: once it is reached, the oldest attendances stop travelling. The conversation being answered never does.\n\nThe count is an estimate, runs low on tool-heavy threads, and leaves out the instructions and the tool definitions. Set it under the budget you actually have.",
-                )}
+                // WHAT IT DOES IS NOT THE SAME FOR A WATCHER (review round 40). An observation does
+                // not travel with the contact's history at all: the tick rebuilds the conversation
+                // from Chatwoot into a single message and keeps its own thread, and the window
+                // always keeps the current turn, so nothing is ever trimmed off a tick. The setting
+                // is NOT inert for it, though, which is why it stays on screen: `runCompaction`
+                // loads a watcher's config with `ignoreMode` and hands this same ceiling to the
+                // summariser, so it bounds the transcript the watcher's memory reads when an
+                // attendance closes. The help says which of the two the operator is buying.
+                help={
+                  watcher
+                    ? t(
+                        "editor.limitsMaxHistoryTokensHelpObserving",
+                        "An observation does not carry this contact's history: each tick rebuilds the conversation from the channel, so this ceiling never trims one.\n\nWhat it does bound is this agent's memory: when an attendance closes, the transcript handed to the summariser is cut to fit.\n\nThe count is an estimate, runs low on tool-heavy threads, and leaves out the instructions and the tool definitions.",
+                      )
+                    : t(
+                        "editor.limitsMaxHistoryTokensHelp",
+                        "The agent sends this contact's whole history on every turn. The more a customer talks, the slower and costlier their answers get.\n\nThe ceiling cuts that off: once it is reached, the oldest attendances stop travelling. The conversation being answered never does.\n\nThe count is an estimate, runs low on tool-heavy threads, and leaves out the instructions and the tool definitions. Set it under the budget you actually have.",
+                      )
+                }
               >
                 <Input
                   type="number"
@@ -3096,6 +3638,7 @@ export function BehaviorTab({
 
           <Section
             id="proactive"
+            hidden={watcher}
             icon={Megaphone}
             title={t("editor.proactiveSection", "Proactive messages")}
             description={t(
@@ -3314,16 +3857,25 @@ export function BehaviorTab({
         onSave={onSave}
         onDiscard={onDiscard}
         saveDisabled={
-          contactAuthUrlInvalid ||
+          // NOTE: Only what a DRAWN section can explain and fix (issue #494 review, round 3). These
+          // read the STORED bag as well as the form, so a watcher carrying a legacy bad TTS
+          // normalizer or authorization URL — an import, an API write, a mode flipped on a
+          // configured agent — had Save dead on a tab whose only editable block is Observation, with
+          // no field on screen saying why. The sections a watcher draws keep their validators; the
+          // answer-only ones are asked only where their fields are.
           sttBaseUrlInvalid ||
           visionBaseUrlInvalid ||
-          normalizeBaseUrlInvalid ||
-          normalizeBaseUrlUnsupported ||
           memoryBaseUrlInvalid ||
           memoryBaseUrlUnsupported ||
+          // The fallback's three moved back OUT of the watcher exemption with the section (issue
+          // #567): they are asked wherever their fields are, and the fields are on screen again.
           fallbackBaseUrlInvalid ||
           fallbackBaseUrlUnsupported ||
-          fallbackModelMissing
+          fallbackModelMissing ||
+          (!watcher &&
+            (contactAuthUrlInvalid ||
+              normalizeBaseUrlInvalid ||
+              normalizeBaseUrlUnsupported))
         }
         onOpenPlayground={onOpenPlayground}
       />

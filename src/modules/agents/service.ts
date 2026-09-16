@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import { broadcastAgentConfigEvent } from "@/api/features/realtime/realtime.service";
@@ -5,7 +6,11 @@ import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { DEFAULT_MODEL_CONFIG, modelConfigSchema } from "@/graph/model-config";
 import { modelOptionalFor } from "@/graph/model-defaults";
-import { NATIVE_TOOL_NAMES, RAG_TOOL_NAMES } from "@/graph/tools/catalog";
+import {
+  CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES,
+  NATIVE_TOOL_NAMES,
+  RAG_TOOL_NAMES,
+} from "@/graph/tools/catalog";
 import { parseDbId, requireDbId } from "@/lib/db-id";
 import {
   AppError,
@@ -19,8 +24,11 @@ import {
   auditSafe,
   grantSetChanged,
 } from "@/modules/agents/audit-projection";
+import { readBehaviorSettings } from "@/modules/agents/behavior-settings";
 import { collectCredentialRefWrites } from "@/modules/agents/credential-paths";
+import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
+import { PROTECTED_LABELS_MAX } from "@/modules/agents/tool-guidance";
 import {
   invalidToolPreconditions,
   parseToolPrecondition,
@@ -44,9 +52,15 @@ import {
   getToolpackToolNames,
   getToolpackToolViews,
 } from "@/modules/integrations/toolpacks";
+import { isOneOf, SIGNATURE_CHOICES } from "@/modules/signature/domains";
 import { lockToolNames } from "@/modules/tool-definitions/namespace";
 import { requireVaultRefFor } from "@/modules/vault/service";
-import { AGENT_MODES, type AgentMode, normalizeAgentMode } from "./mode";
+import {
+  AGENT_MODES,
+  type AgentMode,
+  isMonitoring,
+  normalizeAgentMode,
+} from "./mode";
 
 // Agent configuration CRUD — the config the whole system orbits (the same core the UI config
 // screen and the MCP `prompt_get/set` tools project over). All reads/writes are tenant-scoped;
@@ -181,7 +195,10 @@ export async function listAgentsPaged(
       db.agent.findMany({
         where,
         select: AGENT_SELECT,
-        orderBy: { [orderField]: order },
+        // The id breaks ties, so paging is DETERMINISTIC: two agents sharing a timestamp (or a name)
+        // could otherwise be ordered differently per query, and a walk over pages would return one
+        // twice and miss the other.
+        orderBy: [{ [orderField]: order }, { id: "asc" }],
         skip: offset,
         take: limit,
       }),
@@ -291,6 +308,81 @@ export class SettingsTextTooLongError extends AppError {
   }
 }
 
+// A `settings` bag REPLACES the column, which is the contract every caller has today and the reason
+// this rule is a refusal rather than a merge: the console sends the whole bag, the MCP patch builds
+// one, and flipping the write to merge would silently change what a caller who MEANT replacement
+// gets: the same silence one door over. What is refused is the write that would cost blocks the
+// caller never named. Measured on #612's acceptance run: `{"settings":{"split":{"enabled":false}}}`
+// answered 200 and took signature, debounce, followUp, handoff and eleven other blocks with it.
+export class SettingsBlocksDroppedError extends AppError {
+  constructor(blocks: string[]) {
+    super(
+      `settings would delete configured blocks it does not name: ${blocks.join(", ")}`,
+      400,
+      "errors.settingsBlocksDropped",
+      { blocks: blocks.join(", "), count: blocks.length },
+      "settings",
+    );
+  }
+}
+
+// WHAT THE BAG WOULD COST, asked of the stored row inside the write's own lock like every other rule
+// in this family. A key the bag names is this write's business whatever it holds: `{}` and `null`
+// are edits of that block, and its reader answers what they mean. A key the bag does NOT name is a
+// deletion, and the only ones worth refusing are the ones that would lose something: a block the
+// operator never configured reads back as `{}` from agent_settings_get and materialises empty in
+// the console, so refusing a save over those would be a refusal about nothing.
+//
+// Not `carriesConfiguration` below, which answers a different question on purpose: it reads
+// `false` and `""` as nothing, so a retired taxonomy left as a tombstone is inert. Here a block
+// switched OFF is a decision somebody made, and dropping it reverts that decision to the default.
+function holdsSomething(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+}
+
+export function assertSettingsBlocksKept(
+  settings: unknown,
+  stored: unknown,
+): void {
+  // `undefined` is "this write does not touch the column" (a rename, a mode change) and not an
+  // empty bag. An empty bag IS the whole wipe, and goes through the same question as any other.
+  if (settings === undefined) return;
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return;
+  const next =
+    settings && typeof settings === "object" && !Array.isArray(settings)
+      ? (settings as Record<string, unknown>)
+      : {};
+  // By VALUE, not by `in`: a key that holds `undefined` is named in the object and gone from the row,
+  // because JSON has no spelling for it and the write drops it on the way to Postgres. Measured by
+  // mutation, which is how this stopped being `key in next`: the looser check let `{ signature:
+  // undefined }` through as an edit of the block, and the column then had no signature at all.
+  //
+  // And OWN, not inherited: `{}.constructor` is a function, so a stored block named `constructor` or
+  // `toString` read as present in an empty bag and was deleted without a word (review round 1).
+  //
+  // Except `__proto__`, which no bag can keep: zod's record rebuild drops it before the service and
+  // Prisma drops an own one while serializing (both measured, see the `__proto__` notes in
+  // src/modules/mcp/write.ts and tests/modules/audit-agent-family.test.ts). A row only carries one
+  // from a migration or a direct write, and refusing over it would refuse every save of that agent
+  // forever, over a key the caller has no way to send.
+  const dropped = Object.entries(stored as Record<string, unknown>)
+    .filter(
+      ([key, value]) =>
+        key !== "__proto__" &&
+        (!Object.hasOwn(next, key) || next[key] === undefined) &&
+        holdsSomething(value),
+    )
+    .map(([key]) => key)
+    .sort();
+  // Every block at once, not the first: a caller who learns the size of the mistake one refusal at a
+  // time fixes it one refusal at a time, and the point of this rule is that the whole cost is said
+  // out loud before anything is written.
+  if (dropped.length > 0) throw new SettingsBlocksDroppedError(dropped);
+}
+
 // `stored` is the bag this write replaces, and it is what keeps the refusal answerable: only text the
 // write introduces or changes is refused. See collectOversizedTextChanges for why an already-stored
 // value cannot be one (the editor has no control for several of these fields).
@@ -324,6 +416,42 @@ export class DebugWindowTooLongError extends AppError {
       "errors.debugWindowTooLong",
       { hours },
       "observability.fullDetailUntil",
+    );
+  }
+}
+
+// The signature's switch, refused at the write rather than normalised in the reader (#612). Its
+// value is the only thing that says whether an agent is signing, and a reader that quietly maps
+// `"sim"` onto a boolean leaves GET echoing `"sim"` while the runtime signs: two answers to one
+// question, and the API's is the wrong one. The acceptance run measured exactly that.
+export class InvalidSignatureSwitchError extends AppError {
+  constructor(got: string) {
+    super(
+      `signature.enabled must be a boolean, got ${got}`,
+      400,
+      "errors.invalidSignatureSwitch",
+      { got },
+      "signature.enabled",
+    );
+  }
+}
+
+// THE SIGNATURE'S CLOSED FIELDS, refused at the write rather than normalised in the reader (#616 for
+// `frequency`, #618 for `position` and `separator`). All three normalise in the reader, so a wrong
+// value is harmless to the runtime, and the tie-breaker is what GET does: the API echoes the bag as
+// it was stored, so a normalised value leaves the operator's client reading `"esquerda"` on a field
+// the runtime answered as `"top"`. #612 already settled that two answers to one question is one too
+// many. One class for the three, driven by `SIGNATURE_CHOICES`, because the domains are the reader's
+// own and a per-field copy of them is how two of the three went unguarded.
+export class InvalidSignatureChoiceError extends AppError {
+  constructor(field: string, allowed: readonly string[], got: string) {
+    const list = allowed.map((v) => `"${v}"`).join(", ");
+    super(
+      `signature.${field} must be one of ${list}, got ${got}`,
+      400,
+      "errors.invalidSignatureChoice",
+      { field, allowed: list, got },
+      `signature.${field}`,
     );
   }
 }
@@ -374,6 +502,708 @@ export function assertSettingsToolPreconditions(
   );
   if (introduced === undefined) return;
   throw new InvalidToolPreconditionError(introduced);
+}
+
+// A KEY THAT NO LONGER MEANS ANYTHING IS REFUSED, not merged (issue #568 review).
+//
+// `settings` blocks are LOOSE objects on purpose (settings-schema.ts says why): an undeclared key
+// reaches the readers untouched, so a field added by someone who never opened the schema is not
+// silently dropped. The cost is the mirror case — a field REMOVED from every reader keeps being
+// accepted, stored and answered with 200, and the console shows a taxonomy that governs nothing.
+// The verifier hit all four faces of it: a value outside the group applied, two groups with one
+// name accepted where the previous release answered 400, `noteOnChange: true` inert, and the whole
+// block with no editor to show it.
+//
+// Refused whenever the key CARRIES CONFIGURATION, rather than only when the write changes it (the
+// rule its neighbours use, right for a stored value that still does something) and rather than on
+// mere presence (which round 14 showed breaks ordinary saves — see carriesConfiguration below).
+// `20260910140000_drop_retired_label_settings` clears what is already stored.
+export class RetiredLabelSettingError extends AppError {
+  constructor(key: string) {
+    super(
+      `settings.${key} was retired: say which labels exist and which exclude each other in settings.toolGuidance.set_labels`,
+      400,
+      "errors.retiredLabelSetting",
+      { key },
+      key,
+    );
+  }
+}
+
+// AN EMPTY TOMBSTONE IS NOT A REFUSAL, and the difference is the whole of what makes this shippable.
+// The previous Behavior editor wrote `monitoring.labelGroups` unconditionally, so an agent that never
+// had a taxonomy still carries `[]`; the migration clears what is stored, but during a rolling deploy
+// the OLD console keeps writing it back, and a hard refusal would then fail every save on the new one
+// for a key the operator cannot see or act on. Refusing what carries CONFIGURATION and ignoring what
+// carries none teaches the operator exactly where a real taxonomy went, and is inert for the rest.
+function carriesConfiguration(value: unknown): boolean {
+  if (value === undefined || value === null || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object")
+    return Object.values(value as Record<string, unknown>).some(
+      carriesConfiguration,
+    );
+  return value !== false;
+}
+
+// A GUARD THAT LOOKS ACTIVE AND IS NOT is worse than no guard, which is the same argument
+// `assertSettingsToolPreconditions` makes about a fence the console shows and the runtime ignores.
+// `readProtectedLabels` keeps the first PROTECTED_LABELS_MAX entries and drops the rest — invisible
+// truncation is fine for a list nobody reads back, and this one IS read back: the editor reloads
+// what was stored, so the operator sees sixty labels presented as off limits while ten of them are
+// there for `set_labels` to remove. Refused instead, and only when the write CHANGES the list, so an
+// unrelated PATCH is not the moment to make somebody fix a field they did not come to edit — the
+// rule this file's other size check uses (round 19).
+export class TooManyProtectedLabelsError extends AppError {
+  constructor(max: number) {
+    super(
+      `settings.setLabels.protected takes at most ${max} labels`,
+      400,
+      "errors.tooManyProtectedLabels",
+      { max },
+      "setLabels.protected",
+    );
+  }
+}
+
+function rawProtectedList(settings: unknown): unknown[] | null {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings))
+    return null;
+  const block = (settings as Record<string, unknown>).setLabels;
+  if (!block || typeof block !== "object" || Array.isArray(block)) return null;
+  const raw = (block as Record<string, unknown>).protected;
+  return Array.isArray(raw) ? raw : null;
+}
+
+export function assertSettingsProtectedLabels(
+  settings: unknown,
+  stored: unknown,
+): void {
+  const next = rawProtectedList(settings);
+  if (next === null) return;
+  // Counted the way the READER counts, or the refusal and the truncation would disagree about the
+  // same list: blanks, non-strings and duplicates never became guards in the first place. Counted
+  // HERE rather than by calling the reader, because the reader stops AT the ceiling — asking it how
+  // many there are can never answer more than the ceiling, which is the whole question.
+  const kept = new Set<string>();
+  for (const entry of next) {
+    if (typeof entry !== "string") continue;
+    const label = entry.trim();
+    if (label) kept.add(label);
+  }
+  if (kept.size <= PROTECTED_LABELS_MAX) return;
+  const before = rawProtectedList(stored);
+  if (before !== null && JSON.stringify(before) === JSON.stringify(next))
+    return;
+  throw new TooManyProtectedLabelsError(PROTECTED_LABELS_MAX);
+}
+
+// THE RETIRED NOTE FLAG, TAKEN OUT OF THE BAG ABOUT TO BE STORED, whatever it says.
+//
+// It governs a feature that no longer exists (the note is now something the operator writes in
+// `toolGuidance.set_labels`, like any other instruction), so no value of it is worth keeping — and
+// none of them is worth a 400 either, because the key is written by the previous release's console
+// without anybody choosing it (round 33). Dropped rather than refused is the same verdict the
+// import boundary reached for the same key, for the same reason: failing over a value that governs
+// nothing blocks work the operator cannot unblock from where they are.
+//
+// IN PLACE, on the object the caller is about to write, the way `clampProtectedLabelsInPlace` does:
+// these two asserts run on the settings the write stores, so removing the key here is what keeps a
+// value the migration just cleared from being written straight back by an old console.
+// A CLOSED SETTINGS VALUE THE READER WOULD THROW AWAY, refused on REST (#622). #612, #616 and #618
+// closed this one field at a time; the rest of the bag had the same hole. REST parsed `settings` as a
+// record of unknown, the block's reader replaced an unknown value with its default, the runtime acted
+// on the default, and GET echoed what was sent: two answers to one question, the API's the wrong one.
+//
+// MCP never had it. `BEHAVIOR_PATCH_SHAPE` states the exact question in its own header: a value the
+// reader would throw away is declared, a value it honours after measuring (a clamp, a cap) must still
+// parse, and the blocks are loose so a key no schema knows reaches the reader as before. So this does
+// not write a second list of domains; it asks REST the question MCP already asks.
+export class InvalidSettingsValueError extends AppError {
+  constructor(path: string, expected: string, got: string) {
+    super(
+      `settings.${path} expects ${expected}, got ${got}`,
+      400,
+      "errors.invalidSettingsValue",
+      { field: path, expected, got },
+      path,
+    );
+  }
+}
+
+function plainObject(v: unknown): Record<string, unknown> | undefined {
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : undefined;
+}
+
+function valueAt(root: unknown, path: readonly PropertyKey[]): unknown {
+  let cur: unknown = root;
+  for (const seg of path) {
+    if (cur === null || typeof cur !== "object") return undefined;
+    if (!Object.hasOwn(cur, seg)) return undefined;
+    cur = (cur as Record<PropertyKey, unknown>)[seg];
+  }
+  return cur;
+}
+
+function describeGot(v: unknown): string {
+  if (v === null) return "null";
+  if (typeof v === "string") return JSON.stringify(v);
+  if (Array.isArray(v)) return "array";
+  return typeof v;
+}
+
+function describeExpected(issue: z.core.$ZodIssue): string {
+  if (issue.code === "invalid_value")
+    return `one of ${issue.values.map((v) => JSON.stringify(v)).join(", ")}`;
+  if (issue.code === "invalid_type") return issue.expected;
+  if (issue.code === "invalid_format" && "pattern" in issue && issue.pattern)
+    return `a value matching ${issue.pattern}`;
+  return "a valid value";
+}
+
+// One closed value a block's schema refuses, with the path it sits at and what the reader reads there.
+interface ClosedValueIssue {
+  block: string;
+  path: PropertyKey[];
+  next: unknown;
+  expected: string;
+}
+
+// Every closed value in `bag` the schema MCP asks would refuse, block by block. Shared by the write
+// boundary below, which refuses the first one the write changes, and by the import (#631), which
+// normalizes all of them, so the two cannot disagree about what a closed value outside its domain is.
+function closedValueIssues(bag: Record<string, unknown>): ClosedValueIssue[] {
+  const out: ClosedValueIssue[] = [];
+  for (const [block, schema] of Object.entries(BEHAVIOR_PATCH_SHAPE)) {
+    if (!Object.hasOwn(bag, block)) continue;
+    const value = bag[block];
+    // A block NAMED as null is an edit of it (#619): the reader answers it with its defaults, and GET
+    // echoing `null` claims nothing the runtime reads differently.
+    if (value === null) continue;
+    const parsed = schema.safeParse(value);
+    if (parsed.success) continue;
+    for (const issue of parsed.error.issues) {
+      const next = valueAt(value, issue.path);
+      // `never` is the schema saying "the runtime does not read this key here" (the reply-only
+      // guardrail checks and generation prompt under `input`). MCP refuses them so a caller cannot
+      // store configuration that does nothing; REST cannot refuse them outright, because the console's
+      // own Guardrails save sends the reader's output for the block and that output materialises them
+      // (measured on the base: refusing them refuses the editor on an agent that never had guardrails).
+      // So the question for these is the reader's own: the TYPE it reads there passes, and anything
+      // else is a value it throws away like any other (`"sim"` saved with a 200 until the acceptance
+      // run of #626 asked).
+      let expected: string | undefined;
+      if (issue.code === "invalid_type" && issue.expected === "never") {
+        const read = valueAt(
+          (
+            readBehaviorSettings({ [block]: value }) as unknown as Record<
+              string,
+              unknown
+            >
+          )[block],
+          issue.path,
+        );
+        if (typeof next === typeof read) continue;
+        expected = typeof read;
+      }
+      out.push({
+        block,
+        path: issue.path,
+        next,
+        expected: expected ?? describeExpected(issue),
+      });
+    }
+  }
+  return out;
+}
+
+export function assertSettingsClosedValues(
+  settings: unknown,
+  stored: unknown,
+): void {
+  const bag = plainObject(settings);
+  if (!bag) return;
+  const storedBag = plainObject(stored);
+  for (const { block, path, next, expected } of closedValueIssues(bag)) {
+    // ONLY WHAT THIS WRITE INTRODUCES OR CHANGES, by value and per path, so a legacy row re-sent
+    // untouched saves and a list element is judged field by field. Path by index: a value that moved
+    // to another index is a change, and naming its new path is what lets the caller find it.
+    if (isDeepStrictEqual(next, valueAt(storedBag?.[block], path))) continue;
+    throw new InvalidSettingsValueError(
+      [block, ...path.map(String)].join("."),
+      expected,
+      describeGot(next),
+    );
+  }
+}
+
+// DERIVED, never stored: `observability.fullDetail` is computed from `fullDetailUntil` (docs/logs.md),
+// and a bag that stores it leaves GET and the runtime disagreeing about whether the debug mode is on.
+// The MCP path already writes the storable projection; REST drops the key on the way in, which also
+// cleans a legacy row the next time it is saved. Dropped rather than refused, so that row keeps saving.
+export function stripDerivedFullDetailInPlace(settings: unknown): void {
+  const obs = plainObject(plainObject(settings)?.observability);
+  if (obs && Object.hasOwn(obs, "fullDetail")) delete obs.fullDetail;
+}
+
+// Removes what `path` points at: a key of an object, or an element of a list (the reader drops a list
+// element of the wrong type, so removing it is what the runtime already reads). False when nothing
+// was there, so a refusal about an ABSENT value is not reported as something taken away.
+function removeAt(root: unknown, path: readonly PropertyKey[]): boolean {
+  const parentPath = [...path];
+  const last = parentPath.pop();
+  if (last === undefined) return false;
+  const parent = valueAt(root, parentPath);
+  if (Array.isArray(parent)) {
+    const i = typeof last === "number" ? last : Number(last);
+    if (!Number.isInteger(i) || i < 0 || i >= parent.length) return false;
+    parent.splice(i, 1);
+    return true;
+  }
+  const obj = plainObject(parent);
+  if (!obj || !Object.hasOwn(obj, last as string)) return false;
+  delete obj[last as string];
+  return true;
+}
+
+// Sets what `path` points at, when its parent exists. False otherwise.
+function setAt(
+  root: unknown,
+  path: readonly PropertyKey[],
+  value: unknown,
+): boolean {
+  const parentPath = [...path];
+  const last = parentPath.pop();
+  if (last === undefined) return false;
+  const parent = valueAt(root, parentPath);
+  if (Array.isArray(parent)) {
+    const i = typeof last === "number" ? last : Number(last);
+    if (!Number.isInteger(i) || i < 0 || i >= parent.length) return false;
+    parent[i] = value;
+    return true;
+  }
+  const obj = plainObject(parent);
+  if (!obj || !Object.hasOwn(obj, last as string)) return false;
+  obj[last as string] = value;
+  return true;
+}
+
+// How many tail elements of one list are tried, and how many candidates are judged one by one when the
+// block's whole batch is not reader-equal. Both are ceilings on WORK, not on correctness: past them the
+// values stay where they are, which is the outcome that changes nothing the runtime reads. A bundle is
+// caller input and the import runs inside a 5s transaction, so a bag holding fifty thousand unusable
+// entries has to cost one pass over the block, not one pass per entry (review round 2).
+const IMPORT_POP_LIMIT = 64;
+const IMPORT_ONE_BY_ONE_MAX = 32;
+// And a ceiling on the comparisons themselves, for the whole bag rather than per list: each one reads
+// the block, so a bundle with thousands of lists pays thousands of reads before any per-list limit is
+// reached (review round 4 measured 7.6s that way). Spent, the remaining values stay where they are.
+const IMPORT_READING_CHECKS = 256;
+// How many lists in one block get a tail cut tried on them. The element that slides into a reader's
+// window comes from the list the removal was in, so trying every list of a bag that has thousands of
+// them spends the whole budget before the useful answer is reached.
+const IMPORT_POP_LISTS = 8;
+// How many paths the pass carries back. The import names a handful and counts the rest, and a bundle
+// can hold a million unusable entries in one list: an array of a million paths is neither answerable
+// nor readable (review round 5 hit `RangeError` spreading one).
+const IMPORT_PATHS_KEPT = 64;
+// Every comparison costs a clone and a read of the BLOCK, so the budget above bounds how many are made
+// and this bounds what each one may cost: a block gets fewer the bigger it is, down to the single pass
+// that is the whole point of the batch (review round 7 measured 6s spending a small budget on a block
+// of three hundred thousand labels). Sizes in JSON characters, measured once per block.
+function importChecksFor(weight: number): number {
+  if (weight <= 64_000) return IMPORT_READING_CHECKS;
+  if (weight <= 512_000) return 16;
+  return 1;
+}
+
+// The paths taken out, bounded, beside how many there were.
+interface ImportTaken {
+  paths: string[];
+  count: number;
+}
+
+function newTaken(): ImportTaken {
+  return { paths: [], count: 0 };
+}
+
+function takePath(taken: ImportTaken, path: string): void {
+  taken.count += 1;
+  if (taken.paths.length < IMPORT_PATHS_KEPT) taken.paths.push(path);
+}
+
+function absorbTaken(into: ImportTaken, from: ImportTaken): void {
+  for (const path of from.paths) takePath(into, path);
+  // `takePath` counted only what it kept; the rest are counted here.
+  into.count += from.count - from.paths.length;
+}
+
+type ImportFix =
+  | { kind: "trim"; path: PropertyKey[]; trimmed: string }
+  | { kind: "remove"; path: PropertyKey[] };
+
+// Applies every fix to a copy of the block and answers it with the paths it took out, or null when the
+// block's reading changed anyway. Paths are the BUNDLE's: every fix is applied to a copy of the original
+// value, so an index never names a position some earlier removal created.
+function applyImportFixes(
+  fixes: readonly ImportFix[],
+  value: unknown,
+  block: string,
+  reads: (candidate: unknown) => boolean,
+  attemptCap: number,
+): { next: unknown; taken: ImportTaken } | null {
+  // This attempt's own share of the block's comparisons, so the first one cannot leave the next with
+  // nothing: the batch that fails over a padding is followed by the batch that takes the paddings out.
+  let used = 0;
+  const sameReading = (candidate: unknown) => {
+    if (used >= attemptCap) return false;
+    used += 1;
+    return reads(candidate);
+  };
+  const trial = structuredClone(value);
+  const taken = newTaken();
+  for (const fix of fixes) {
+    if (fix.kind === "trim") setAt(trial, fix.path, fix.trimmed);
+  }
+  // Keys first, elements after: a key is addressed inside an element the bundle numbered, so removing
+  // elements first would renumber the list under the paths still to be applied.
+  const lists = new Map<
+    string,
+    { at: PropertyKey[]; drop: Set<number>; kept: number[]; arr: unknown[] }
+  >();
+  for (const fix of fixes) {
+    if (fix.kind !== "remove") continue;
+    const at = [...fix.path];
+    const last = at.pop();
+    const parent = valueAt(trial, at);
+    if (Array.isArray(parent) && last !== undefined) {
+      const key = at.map(String).join(".");
+      const list = lists.get(key) ?? {
+        at,
+        drop: new Set<number>(),
+        kept: [],
+        // The ARRAY ITSELF, kept from here on. A nested list is addressed through its element's index,
+        // so once an outer element is out the path that found it names something else, or nothing
+        // (review round 3: resolving it again threw and took the import and its preview down).
+        arr: parent,
+      };
+      list.drop.add(Number(last));
+      lists.set(key, list);
+      takePath(taken, [block, ...fix.path.map(String)].join("."));
+      continue;
+    }
+    if (removeAt(trial, fix.path))
+      takePath(taken, [block, ...fix.path.map(String)].join("."));
+  }
+  // Deepest list first, for the same reason: an inner list is addressed through its element's index.
+  const byDepth = [...lists.values()].sort((a, b) => b.at.length - a.at.length);
+  for (const list of byDepth) {
+    const arr = list.arr;
+    const kept: unknown[] = [];
+    arr.forEach((element, i) => {
+      if (list.drop.has(i)) return;
+      kept.push(element);
+      list.kept.push(i);
+    });
+    arr.length = 0;
+    for (const element of kept) arr.push(element);
+  }
+  // A list the reader cuts to a window BEFORE it filters: what slid into the window from past it is an
+  // element the reader ignored, and taking that too is what keeps the window's contents. Named by its
+  // own index in the bundle, which is why the kept indices are carried here.
+  let settled = sameReading(trial);
+  let listsTried = 0;
+  for (const list of byDepth) {
+    if (settled || listsTried >= IMPORT_POP_LISTS || used >= attemptCap) break;
+    listsTried += 1;
+    const arr = list.arr;
+    let floor = Number.POSITIVE_INFINITY;
+    for (const i of list.drop) floor = Math.min(floor, i);
+    // Only when the window could be reached by the cuts this is willing to make. A list the reader does
+    // not window at all is every list but a few, and trying the tail on a long one costs a read of the
+    // whole block per element for nothing (review round 5 measured 12s on a list of fifteen thousand).
+    if (arr.length - floor > IMPORT_POP_LIMIT) continue;
+    // Tried on THIS list and undone when it does not settle it: the difference may belong to another
+    // list entirely, and popping here would take an element no reader ignores (a valid label off a
+    // step, measured while fixing review round 3).
+    const before = [...arr];
+    const keptBefore = [...list.kept];
+    const takenBefore = { paths: [...taken.paths], count: taken.count };
+    let pops = 0;
+    while (
+      !settled &&
+      pops < IMPORT_POP_LIMIT &&
+      arr.length > 0 &&
+      (list.kept[list.kept.length - 1] ?? -1) > floor
+    ) {
+      takePath(
+        taken,
+        [block, ...list.at.map(String), String(list.kept.pop())].join("."),
+      );
+      arr.pop();
+      pops += 1;
+      settled = sameReading(trial);
+    }
+    if (settled) continue;
+    arr.length = 0;
+    for (const element of before) arr.push(element);
+    list.kept = keptBefore;
+    taken.paths = takenBefore.paths;
+    taken.count = takenBefore.count;
+  }
+  return settled ? { next: trial, taken } : null;
+}
+
+// WHAT CREATE REFUSES, AN IMPORT NORMALIZES (#631).// WHAT CREATE REFUSES, AN IMPORT NORMALIZES (#631). A bundle is authored somewhere else, so the import
+// path does not refuse it whole over one field (transfer.ts already clamps over-cap prose and the
+// protected-label list for that reason); it takes the unusable value out, so the reader's default
+// applies and GET agrees with the runtime, and hands back the paths so the import can say what it
+// took. Asked by the same predicates the write boundary refuses on, never by a second copy of them.
+// Returns the paths taken out, bounded, beside how many there were.
+export function dropUnusableImportedSettingsInPlace(
+  settings: unknown,
+): ImportTaken {
+  const bag = plainObject(settings);
+  if (!bag) return newTaken();
+  const dropped = newTaken();
+  // Derived from `fullDetailUntil`, and dropped as create drops it. Named here, unlike on create: the
+  // bundle's author wrote the flag believing the debug mode was on, and an import is the one door
+  // where nobody is at the editor to see that it is not.
+  const obs = plainObject(bag.observability);
+  if (obs && Object.hasOwn(obs, "fullDetail")) {
+    stripDerivedFullDetailInPlace(bag);
+    takePath(dropped, "observability.fullDetail");
+  }
+  // A guard that cannot parse guards nothing, and the reader drops it WHOLE; the import says so. Asked
+  // the READER's question, not the write boundary's: a rule keyed by a custom tool (a bundled HTTP tool
+  // named `assign_label`, one renamed to `set_labels_2`) is refused by create, which only offers the
+  // natives, but `readToolPreconditions` honours it and the import has carried it on purpose since
+  // #568, so removing it here would open a tool the bundle guards. Before the closed values, which
+  // would otherwise take one field out of a rule: an `equals` of the wrong type removed alone turns "the
+  // attribute must be X", which the runtime ignores, into "the attribute must exist", a guard nobody
+  // wrote.
+  // A bag that is not an object at all is the closed values' business below (the block's own schema
+  // refuses it at its root); only the rules inside one are judged here. A `null` rule is a removal
+  // create accepts and the reader ignores, so it stays.
+  const guards = plainObject(bag.toolPreconditions);
+  for (const [name, raw] of Object.entries(guards ?? {})) {
+    if (raw === null || parseToolPrecondition(raw) !== null) continue;
+    delete (guards as Record<string, unknown>)[name];
+    takePath(dropped, `toolPreconditions.${name}`);
+  }
+  // THE INVARIANT: what the runtime reads does not change. A closed value the reader throws away is
+  // taken out, which by definition leaves the block's reading as it was; a change the reader would
+  // notice is not a normalization, and review round 1 found three (a padded guard scope whose field
+  // removal voided the whole guard, a padded `tts.mode` the reader trims and honours, and an invalid
+  // follow-up step whose removal pulled an eleventh step into the reader's ten-step window). So every
+  // candidate is tried on a copy and kept only when `readBehaviorSettings` answers the same for the
+  // block. Last issue first: zod reports a list in index order, so working from the end never moves
+  // the path of an element still to be judged.
+  const now = new Date();
+  const readBlock = (block: string, value: unknown) =>
+    (
+      readBehaviorSettings({ [block]: value }, now) as unknown as Record<
+        string,
+        unknown
+      >
+    )[block];
+  const budget = { left: IMPORT_READING_CHECKS };
+  const byBlock = new Map<string, ClosedValueIssue[]>();
+  for (const issue of closedValueIssues(bag)) {
+    const list = byBlock.get(issue.block) ?? [];
+    list.push(issue);
+    byBlock.set(issue.block, list);
+  }
+  for (const [block, issues] of byBlock) {
+    const reading = readBlock(block, bag[block]);
+    const allowance = {
+      left: Math.min(
+        budget.left,
+        importChecksFor(JSON.stringify(bag[block])?.length ?? 0),
+      ),
+    };
+    const sameReading = (candidate: unknown) => {
+      if (allowance.left <= 0) return false;
+      allowance.left -= 1;
+      budget.left -= 1;
+      return isDeepStrictEqual(readBlock(block, candidate), reading);
+    };
+    // The block itself is the wrong type: the reader answers it with every default.
+    if (issues.some((i) => i.path.length === 0)) {
+      if (sameReading(undefined)) {
+        delete bag[block];
+        takePath(dropped, block);
+      }
+      continue;
+    }
+    // A padded value the reader trims and honours is stored trimmed rather than taken out, and nothing
+    // is lost to warn about. Which paddings the schema then accepts is asked ONCE, not per value.
+    const padded = issues.filter(
+      (i) => typeof i.next === "string" && i.next.trim() !== i.next,
+    );
+    let trimmable = new Set<string>();
+    if (padded.length > 0) {
+      const trimTrial = structuredClone(bag[block]);
+      for (const i of padded)
+        setAt(trimTrial, i.path, (i.next as string).trim());
+      const stillFlagged = new Set(
+        closedValueIssues({ [block]: trimTrial }).map((i) =>
+          i.path.map(String).join("."),
+        ),
+      );
+      trimmable = new Set(
+        padded
+          .map((i) => i.path.map(String).join("."))
+          .filter((key) => !stillFlagged.has(key)),
+      );
+    }
+    const fixFor = (issue: ClosedValueIssue): ImportFix =>
+      trimmable.has(issue.path.map(String).join("."))
+        ? {
+            kind: "trim",
+            path: issue.path,
+            trimmed: (issue.next as string).trim(),
+          }
+        : { kind: "remove", path: issue.path };
+    const fixes = issues.map(fixFor);
+    // The whole block in one pass first, which is what a bundle with many unusable entries costs.
+    // Half the block's share, so the second attempt below still has one.
+    const batch = applyImportFixes(
+      fixes,
+      bag[block],
+      block,
+      sameReading,
+      Math.max(1, Math.floor(allowance.left / 2)),
+    );
+    if (batch) {
+      bag[block] = batch.next;
+      absorbTaken(dropped, batch.taken);
+      continue;
+    }
+    // One padding the reader does not honour would otherwise cost the block its whole pass, and with it
+    // every other value in there once the list is past the one-by-one ceiling. Asked once more with the
+    // paddings taken out instead of trimmed.
+    if (trimmable.size > 0) {
+      const asRemovals = issues.map((issue) => ({
+        kind: "remove" as const,
+        path: issue.path,
+      }));
+      const second = applyImportFixes(
+        asRemovals,
+        bag[block],
+        block,
+        sameReading,
+        allowance.left,
+      );
+      if (second) {
+        bag[block] = second.next;
+        absorbTaken(dropped, second.taken);
+        continue;
+      }
+    }
+    // Some value in there is one the runtime reads. Judged one by one, each time from the bundle's own
+    // value plus what has been accepted so far, so a rejected fix leaves no trace and an index still
+    // names the position the bundle wrote. Bounded, because this is the quadratic path.
+    if (fixes.length > IMPORT_ONE_BY_ONE_MAX) continue;
+    const accepted: ImportFix[] = [];
+    let best: { next: unknown; taken: ImportTaken } | null = null;
+    for (const fix of fixes) {
+      if (allowance.left <= 0) break;
+      const withTrim = applyImportFixes(
+        [...accepted, fix],
+        bag[block],
+        block,
+        sameReading,
+        allowance.left,
+      );
+      if (withTrim) {
+        accepted.push(fix);
+        best = withTrim;
+        continue;
+      }
+      if (fix.kind !== "trim") continue;
+      // Trimming it changed the reading; taking it out may not.
+      const asRemoval: ImportFix = { kind: "remove", path: fix.path };
+      const withRemoval = applyImportFixes(
+        [...accepted, asRemoval],
+        bag[block],
+        block,
+        sameReading,
+        allowance.left,
+      );
+      if (withRemoval) {
+        accepted.push(asRemoval);
+        best = withRemoval;
+      }
+    }
+    if (best) {
+      bag[block] = best.next;
+      absorbTaken(dropped, best.taken);
+    }
+  }
+  // Half a fallback is no fallback to the runtime (`hasModelFallback`), and a stored half is what the
+  // write boundary refuses: the pair goes, the rest of the block stays. After the closed values, since
+  // a provider outside its domain taken out above leaves exactly this half.
+  const pair = fallbackPair(bag);
+  if (pair) {
+    const provider = namedOrNull(pair.provider);
+    const model = namedOrNull(pair.model);
+    const complete =
+      provider !== null && (model !== null || modelOptionalFor(provider));
+    if (!complete && (provider !== null || model !== null)) {
+      const fb = bag.modelFallback as Record<string, unknown>;
+      delete fb.provider;
+      delete fb.model;
+      takePath(dropped, "modelFallback");
+    }
+  }
+  return dropped;
+}
+
+export function stripRetiredNoteFlagInPlace(settings: unknown): boolean {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings))
+    return false;
+  const monitoring = (settings as Record<string, unknown>).monitoring;
+  if (
+    !monitoring ||
+    typeof monitoring !== "object" ||
+    Array.isArray(monitoring)
+  )
+    return false;
+  const mon = monitoring as Record<string, unknown>;
+  if (!("noteOnChange" in mon)) return false;
+  delete mon.noteOnChange;
+  return true;
+}
+
+export function assertSettingsRetiredLabelKeys(settings: unknown): void {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings))
+    return;
+  const bag = settings as Record<string, unknown>;
+  if (carriesConfiguration(bag.labels))
+    throw new RetiredLabelSettingError("labels");
+  const monitoring = bag.monitoring;
+  if (
+    !monitoring ||
+    typeof monitoring !== "object" ||
+    Array.isArray(monitoring)
+  )
+    return;
+  const mon = monitoring as Record<string, unknown>;
+  if (carriesConfiguration(mon.labelGroups))
+    throw new RetiredLabelSettingError("monitoring.labelGroups");
+  // NOTE: `monitoring.noteOnChange` IS NOT REFUSED, it is stripped — see
+  // `stripRetiredNoteFlagInPlace`, called by the same writers. Round 25 refused every value but
+  // `false` on the argument that each asks for a behaviour that no longer exists; round 33 measured
+  // what that costs during a rolling deploy and it is the rollout itself. The previous console does
+  // not ask for the behaviour, it RECONSTRUCTS the key: `readMonitoringConfig` defaults it to
+  // `true` when absent, `observationToForm` puts it in the form, and `observationToStored` writes
+  // it back on every Behavior save. So the moment the migration clears the stored key, every save
+  // made from a console of the previous release answers 400 naming `toolGuidance.set_labels` — for
+  // a save that had nothing to do with labels, and with no control on that screen the operator can
+  // act on. A refusal an operator cannot act on is not a refusal, it is an outage.
 }
 
 // A TOMBSTONE FOR A RULE THAT IS ACTUALLY THERE, which the catalog restriction must not block.
@@ -552,6 +1382,50 @@ export function assertSettingsModelFallback(
   );
 }
 
+// REFUSED AT THE BOUNDARY, and only when this write introduces or changes it, the way every other
+// rule in this family is scoped: a stored bad value must not freeze a save that edits some other
+// section. `undefined` is not a bad value, it is the pre-#612 bag, and the reader answers it from
+// the text.
+export function assertSettingsSignature(
+  settings: unknown,
+  stored: unknown,
+): void {
+  const next = rawSignatureField(settings, "enabled");
+  if (next !== undefined && typeof next !== "boolean") {
+    if (!isDeepStrictEqual(next, rawSignatureField(stored, "enabled")))
+      throw new InvalidSignatureSwitchError(
+        next === null ? "null" : typeof next,
+      );
+  }
+  // Per FIELD, with the family's scoping: only a value this write introduces or changes. A legacy row
+  // re-sent untouched saves, and fixing one of its fields does not require fixing the others.
+  for (const [choice, allowed] of Object.entries(SIGNATURE_CHOICES)) {
+    const value = rawSignatureField(settings, choice);
+    if (value === undefined || isOneOf(allowed, value)) continue;
+    // By VALUE: a legacy `position: {}` re-sent through JSON is a new object every time, and `===`
+    // would refuse the very save this exemption is for.
+    if (isDeepStrictEqual(value, rawSignatureField(stored, choice))) continue;
+    throw new InvalidSignatureChoiceError(
+      choice,
+      allowed,
+      value === null
+        ? "null"
+        : typeof value === "string"
+          ? `"${value}"`
+          : Array.isArray(value)
+            ? "array"
+            : typeof value,
+    );
+  }
+}
+
+function rawSignatureField(settings: unknown, field: string): unknown {
+  if (!settings || typeof settings !== "object") return undefined;
+  const sg = (settings as Record<string, unknown>).signature;
+  if (!sg || typeof sg !== "object") return undefined;
+  return (sg as Record<string, unknown>)[field];
+}
+
 export function assertSettingsDebugWindow(
   settings: unknown,
   stored: unknown,
@@ -703,6 +1577,32 @@ export function assertAgentUpdatable(patch: AgentUpdate): {
   };
 }
 
+// THE OBSERVER REFUSAL, ASKABLE ON ITS OWN (issue #476 review, round 46). `updateAgent` refuses to
+// save a non-monitoring mode on an agent that observes an inbox, and `deleteAgent` refuses to delete
+// one — both from inside their transactions, where an MCP dry run never goes. A preview that cannot
+// ask the same question approves what the apply then rejects, and the caller learns the truth from
+// the 422; the previews call this instead, so the two answers cannot drift.
+//
+// Scoped like every other read here, and it asks about the AGENT rather than about the move: a
+// production agent a race left observing is refused the same way, which is the state `updateAgent`
+// deliberately refuses against.
+export async function assertAgentNotObserving(
+  ctx: TenantContext,
+  id: bigint,
+  base?: PrismaClient,
+): Promise<void> {
+  const observing = await runScopedOn(base ?? basePrisma, ctx, (db) =>
+    db.inboxObserver.count({ where: { agentId: id } }),
+  );
+  if (observing > 0) {
+    throw new AppError(
+      "this agent observes inboxes; remove it as an observer first",
+      422,
+      "errors.agentObservesInboxes",
+    );
+  }
+}
+
 export async function updateAgent(
   ctx: TenantContext,
   id: bigint,
@@ -711,7 +1611,12 @@ export async function updateAgent(
   // Optimistic concurrency (editor): when set, the update only applies if the row's updatedAt still
   // matches; a mismatch yields 409 (errors.agentModifiedElsewhere) instead of silently overwriting a
   // change made elsewhere (another tab, the REST API, or the MCP server). Omitted ⇒ last-write-wins.
-  opts: { expectedUpdatedAt?: Date } = {},
+  //
+  // `settingsMode: "replace"` is the caller saying the bag is COMPLETE, so the blocks it omits are
+  // meant to go. Omitted, a bag that would drop configured blocks is refused instead (#614). Not a
+  // default that changes the write: every path that already sends a whole bag (the console, the MCP
+  // patch, which merges onto the stored one first) passes either way.
+  opts: { expectedUpdatedAt?: Date; settingsMode?: "replace" } = {},
 ): Promise<AgentDto> {
   const {
     rest,
@@ -777,10 +1682,49 @@ export async function updateAgent(
     }
     // NOTE: Inside the lock, against the row this write replaces — reading the stored bag separately
     // would compare against a value another writer could have changed in between.
+    // FIRST of the settings rules, because it is the only structural one: the others ask whether a
+    // value is allowed, this one asks whether the write keeps the blocks it does not mention. A bag
+    // that is both partial and carries a bad value has a bigger problem than the value.
+    if (opts.settingsMode !== "replace") {
+      assertSettingsBlocksKept(rest.settings, before?.settings);
+    }
     assertSettingsTextSizes(rest.settings, before?.settings);
     assertSettingsDebugWindow(rest.settings, before?.settings);
     assertSettingsModelFallback(rest.settings, before?.settings, "replace");
+    assertSettingsSignature(rest.settings, before?.settings);
     assertSettingsToolPreconditions(rest.settings, before?.settings);
+    assertSettingsRetiredLabelKeys(rest.settings);
+    stripRetiredNoteFlagInPlace(rest.settings);
+    stripDerivedFullDetailInPlace(rest.settings);
+    assertSettingsProtectedLabels(rest.settings, before?.settings);
+    // LAST of the settings rules, after both strips: the dedicated rules above answer their fields
+    // with their own sentences, and a retired or derived key is gone before the schema is asked.
+    assertSettingsClosedValues(rest.settings, before?.settings);
+    // NOTE: An OBSERVER of an inbox (issue #476) is a monitoring agent by construction — the route it
+    // holds answers nothing whatever the mode says — so the mode is not this agent's to leave while
+    // it observes. Refused rather than kept silently on the observer's path: an operator promoting a
+    // watcher expects answers, and the honest answer is that the binding has to go first. Inside
+    // the lock. A promotion that lands while an attach is in flight (the row is written only once
+    // Chatwoot agreed) leaves a production observer; the receiver honours the row, and this refusal
+    // holds from then on.
+    //
+    // ASKED OF THE TARGET, not of the move (issue #476 review, round 7): the same race that leaves a
+    // production observer would then let every later write past this guard — production to test, and
+    // back — because the mode it is leaving is no longer monitoring. What the refusal is about is
+    // the state it refuses to save, so a non-monitoring mode with an observer row standing is
+    // refused whatever the row said before.
+    if (before && rest.mode !== undefined && !isMonitoring(rest.mode)) {
+      const observing = await db.inboxObserver.count({
+        where: { agentId: id },
+      });
+      if (observing > 0) {
+        throw new AppError(
+          "this agent observes inboxes; remove it as an observer first",
+          422,
+          "errors.agentObservesInboxes",
+        );
+      }
+    }
     // NOTE: Inside the lock and against the same row, for the reason above: "did this write change
     // the ref" has to be asked of the value this write replaces. It also rewrites `rest` in place,
     // so the normalization below copies the canonical bag rather than the submitted one.
@@ -973,7 +1917,13 @@ export function assertAgentCreatable(input: AgentCreate): {
   assertSettingsTextSizes(input.settings, undefined);
   assertSettingsDebugWindow(input.settings, undefined);
   assertSettingsModelFallback(input.settings, undefined, "replace");
+  assertSettingsSignature(input.settings, undefined);
   assertSettingsToolPreconditions(input.settings, undefined);
+  assertSettingsRetiredLabelKeys(input.settings);
+  stripRetiredNoteFlagInPlace(input.settings);
+  stripDerivedFullDetailInPlace(input.settings);
+  assertSettingsProtectedLabels(input.settings, undefined);
+  assertSettingsClosedValues(input.settings, undefined);
   const data = parseInput(agentCreateSchema, input);
   validateModelConfigForWrite(data.modelConfig);
   // NOTE: the two schedule ids are parsed HERE and handed back, not left to the caller. They are a
@@ -1092,11 +2042,23 @@ export async function deleteAgent(
     const doomedRows = await db.$queryRaw<Array<{ name: string }>>`
       SELECT name FROM agents WHERE id = ${id} FOR UPDATE`;
     const doomed = doomedRows[0];
+    // NOTE: An OBSERVER binding (issue #476) is a bot attached on Chatwoot's side, and the cascade
+    // below would retire the row and the route token while the fork kept delivering to a bot that
+    // is gone. The detach is a Chatwoot call, which this transaction cannot make, so the deletion
+    // is refused while the agent observes anything — the same answer its mode change gets.
+    const observing = await db.inboxObserver.count({ where: { agentId: id } });
+    if (observing > 0) {
+      throw new AppError(
+        "this agent observes inboxes; remove it as an observer first",
+        422,
+        "errors.agentObservesInboxes",
+      );
+    }
     // Inbox.agentId and Experiment.agentId are plain references (no FK cascade) — null them so a
     // deleted agent leaves no dangling binding. AgentToolSelection cascades via its FK.
     await db.inbox.updateMany({
       where: { agentId: id },
-      data: { agentId: null },
+      data: { agentId: null, responderBoundAt: null },
     });
     await db.experiment.updateMany({
       where: { agentId: id },
@@ -1245,10 +2207,16 @@ export interface ToolGrantDto {
   enabledTools: string[];
 }
 
+const DELIVERS_TO_CUSTOMER = new Set<string>(
+  CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES,
+);
+
 export interface ToolSelectionView {
   grants: ToolGrantDto[];
   catalog: {
-    native: { name: string }[];
+    // `deliversToCustomer` is what a MUTED turn will not be offered (the observer's): the editor
+    // reads it instead of keeping its own list of names.
+    native: { name: string; deliversToCustomer?: boolean }[];
     rag: { name: string }[];
     toolDefinitions: {
       id: string;
@@ -1266,6 +2234,8 @@ export interface ToolSelectionView {
       tools: {
         name: string;
         args: { name: string; description?: string; required: boolean }[];
+        // Same question the natives above answer, from the pack's own spec.
+        deliversToCustomer?: boolean;
       }[];
     }[];
     // Operator-authored code tools (issue #363); `name` is what the agent calls.
@@ -1691,7 +2661,10 @@ async function buildToolSelectionView(
     agentUpdatedAt: agent?.updatedAt ?? null,
     grants: grants.map(toGrantDto),
     catalog: {
-      native: NATIVE_TOOL_NAMES.map((n) => ({ name: n })),
+      native: NATIVE_TOOL_NAMES.map((n) => ({
+        name: n,
+        ...(DELIVERS_TO_CUSTOMER.has(n) ? { deliversToCustomer: true } : {}),
+      })),
       rag: RAG_TOOL_NAMES.map((n) => ({ name: n })),
       toolDefinitions: toolDefinitions.map((t) => ({
         id: String(t.id),

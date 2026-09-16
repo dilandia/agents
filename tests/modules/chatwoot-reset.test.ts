@@ -367,6 +367,13 @@ describe.skipIf(!dbUp)(
           name: "Atendente",
           systemPrompt: "x",
           mode: "test",
+          // A RUNNABLE model configuration, which the hand-back asks for since issue #495 review
+          // round 6: an unconfigured agent cannot answer, so it cannot be handed a conversation.
+          modelConfig: {
+            provider: "openai-compatible",
+            model: "local",
+            baseURL: "https://llm.example.invalid/v1",
+          },
         },
       });
       const inbox = await suDb.inbox.create({
@@ -687,6 +694,13 @@ describe.skipIf(!dbUp)(
             name: "Atendente",
             systemPrompt: "x",
             mode: "test",
+            // A RUNNABLE model configuration, which the hand-back asks for since issue #495 review
+            // round 6: an unconfigured agent cannot answer, so it cannot be handed a conversation.
+            modelConfig: {
+              provider: "openai-compatible",
+              model: "local",
+              baseURL: "https://llm.example.invalid/v1",
+            },
           },
         });
         const inbox = await suDb.inbox.create({
@@ -1479,10 +1493,86 @@ describe.skipIf(!dbUp)(
       });
     });
 
+    // A verdict armed AFTER the command belongs to the new episode (issue #477 review, round 21).
+    // The cancel runs late in the reset — past the memory clear and a dozen Chatwoot calls — so a
+    // customer message landing in that stretch arms a burst the operator wants classified, and an
+    // unqualified prefix cancel marked it DONE.
+    test("a verdict armed after the command survives the reset", async () => {
+      const threadId = `${tenantId}:${instanceId}:${CONV_ID}`;
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
+      await suDb.schedulerJob.createMany({
+        data: [
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:7`,
+            runAt: new Date(Date.now() + 3_600_000),
+            payload: {
+              threadId,
+              agentId: "7",
+              reason: "burst",
+              atMessageId: 1,
+            },
+          },
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:9`,
+            runAt: new Date(Date.now() + 3_600_000),
+            // Above any id this suite's commands carry (`9000 + n`): the new episode's burst.
+            payload: {
+              threadId,
+              agentId: "9",
+              reason: "burst",
+              atMessageId: 999_999,
+            },
+          },
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:11`,
+            runAt: new Date(Date.now() + 3_600_000),
+            // A RESOLVE names no message, so it orders against nothing here and is left to the
+            // tick's own reopen fence — the command is an incoming message, so the conversation the
+            // verdict was armed for is no longer resolved.
+            payload: { threadId, agentId: "11", reason: "resolved" },
+          },
+        ],
+      });
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset();
+
+      const jobs = await suDb.schedulerJob.findMany({
+        where: { tenantId, kind: "OBSERVE" },
+        select: { dedupeKey: true, status: true },
+        orderBy: { dedupeKey: "asc" },
+      });
+      expect(
+        jobs.map((j) => [j.dedupeKey.split(":").at(-1), j.status]),
+      ).toEqual([
+        ["11", "PENDING"],
+        ["7", "DONE"],
+        ["9", "PENDING"],
+      ]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: CONV_ID },
+        select: { resetAtMessageId: true },
+      });
+      // The boundary the cancel was fenced on is the command's own message id.
+      expect(conv.resetAtMessageId).toBeGreaterThan(2);
+      expect(conv.resetAtMessageId).toBeLessThan(999_999);
+    });
+
     // Jobs the episode armed. /reset already cancels FOLLOWUP and MEMORY_COMPACT; these two carry
     // exactly the same argument and were left running.
     test("the jobs the episode armed are cancelled with it", async () => {
       const threadId = `${tenantId}:${instanceId}:${CONV_ID}`;
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
       await suDb.schedulerJob.createMany({
         data: [
           {
@@ -1508,6 +1598,36 @@ describe.skipIf(!dbUp)(
             runAt: new Date(Date.now() + 3_600_000),
             payload: { threadId, agentBotId: 1, burstStartedAt: Date.now() },
           },
+          // A watcher's queued VERDICT (issue #477 review, round 5). It reads the conversation from
+          // Chatwoot rather than from memory, so left armed it wakes up after this command and
+          // writes back the very labels the reset cleared. Two of them, because the key carries the
+          // classifier and a conversation can have two.
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:7`,
+            runAt: new Date(Date.now() + 3_600_000),
+            payload: {
+              threadId,
+              agentId: "7",
+              reason: "burst",
+              // Below the command's own id, which is what makes these the OLD episode's verdicts
+              // (round 21). The command arrives as message `9000 + n`.
+              atMessageId: 1,
+            },
+          },
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:9`,
+            runAt: new Date(Date.now() + 3_600_000),
+            payload: {
+              threadId,
+              agentId: "9",
+              reason: "burst",
+              atMessageId: 2,
+            },
+          },
         ],
       });
       const cw = fakeChatwoot();
@@ -1518,17 +1638,27 @@ describe.skipIf(!dbUp)(
         where: {
           tenantId,
           kind: {
-            in: ["REDIRECT_FOLLOWUP", "APPOINTMENT_REMINDER", "DEBOUNCE"],
+            in: [
+              "REDIRECT_FOLLOWUP",
+              "APPOINTMENT_REMINDER",
+              "DEBOUNCE",
+              "OBSERVE",
+            ],
           },
         },
         select: { kind: true, status: true, payload: true },
         orderBy: { kind: "asc" },
       });
+      expect(
+        jobs.filter((j) => j.kind === "OBSERVE").map((j) => j.status),
+      ).toEqual(["DONE", "DONE"]);
       // Enum declaration order, which is what Prisma sorts an enum column by.
       expect(jobs.map((j) => [j.kind, j.status])).toEqual([
         ["DEBOUNCE", "DONE"],
         ["APPOINTMENT_REMINDER", "DONE"],
         ["REDIRECT_FOLLOWUP", "DONE"],
+        ["OBSERVE", "DONE"],
+        ["OBSERVE", "DONE"],
       ]);
       // Tombstoned too, and for the same reason as the reminder: a flush already CLAIMED is past
       // every cancel, so the stamp is the only thing its handler can see.
@@ -2986,6 +3116,26 @@ describe.skipIf(!dbUp)(
       await suDb.conversation.deleteMany({
         where: { tenantId, chatwootConversationId: 43 },
       });
+    });
+
+    // ISSUE #642, ROUND 21. `reset_at_message_id` is the id of the command's own MESSAGE and the
+    // cleanup that follows is a dozen un-serialized calls, so every row the command wrote carries a
+    // higher id and looks like the erased episode's history to whoever reads the conversation next.
+    // The acknowledgement is posted only once every step has run, so its id is the end of that
+    // stretch — but only if it is findable, which is what this name is for (constants.ts).
+    test("the acknowledgement carries the name that says where the cleanup ended", async () => {
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset();
+
+      const acks = ackCalls(cw.calls);
+      expect(acks).toHaveLength(1);
+      const body = acks[0]?.body as {
+        content_attributes?: { fazer_ai_send_id?: unknown };
+      } | null;
+      expect(body?.content_attributes?.fazer_ai_send_id).toBe(
+        `reset-ack:${9000 + deliverySeq}`,
+      );
     });
 
     test("a partial reset is not announced as a full one", async () => {

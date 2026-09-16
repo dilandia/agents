@@ -20,6 +20,7 @@ import {
   Button,
   Dropdown,
   FormField,
+  Input,
   SelectableCard,
   SwitchField,
   Textarea,
@@ -90,11 +91,11 @@ function integrationIcon(catalogType: string): LucideIcon {
 // the tool's model-facing description.
 const HANDOFF_TOOL = "handoff_to_human";
 const KANBAN_TOOL = "kanban_move_card";
-// set_custom_attribute + assign_label both act on conversation/contact/task (scope) and accept
+// set_custom_attribute + set_labels both act on conversation/contact/task (scope) and accept
 // operator-authored "when to use" guidance, so they render as configurable cards too. Their guidance
 // lives in the flat agent.settings.toolGuidance map (handoff/kanban use their own grouped config).
 const ATTR_TOOL = "set_custom_attribute";
-const LABEL_TOOL = "assign_label";
+const LABEL_TOOL = "set_labels";
 // update_kanban_task (edit the linked card's title/description/priority/dates) also takes optional
 // operator guidance, so it renders as a configurable card next to kanban_move_card.
 const UPDATE_KANBAN_TOOL = "update_kanban_task";
@@ -102,6 +103,14 @@ const UPDATE_KANBAN_TOOL = "update_kanban_task";
 interface Props {
   // The agent being edited — scopes the handoff target picker to the accounts it serves.
   agentId: string;
+  // WHETHER THIS AGENT ONLY WATCHES. A monitoring turn builds its Chatwoot client MUTED, and the
+  // assembly then drops every tool whose whole point is to put something in front of the customer:
+  // the two natives flagged `deliversToCustomer`, the document tools, and a toolpack's delivery
+  // tools. Offering those grants here would be a control that cannot fire — the same class as the
+  // retired settings this issue refused, arriving through the editor instead of the API. Grants
+  // already saved are left ALONE, so flipping the mode back returns the agent as it was
+  // (review round 30).
+  observing?: boolean;
   catalog: ToolCatalog;
   grants: GrantState[];
   onChange: (grants: GrantState[]) => void;
@@ -118,7 +127,7 @@ interface Props {
   // steps), appended to its model-facing description. Persisted in agent.settings.kanban.instructions.
   kanbanInstructions: string;
   setKanbanInstructions: (v: string) => void;
-  // Operator-authored guidance for set_custom_attribute + assign_label (when to use each scope/label/
+  // Operator-authored guidance for set_custom_attribute + set_labels (when to use each scope/label/
   // attribute), appended to their model-facing descriptions. Persisted in agent.settings.toolGuidance.
   customAttributeInstructions: string;
   // The refused note this editor draws, if the standing refusal is about one -- see ToolRefusals.
@@ -126,6 +135,10 @@ interface Props {
   setCustomAttributeInstructions: (v: string) => void;
   labelInstructions: string;
   setLabelInstructions: (v: string) => void;
+  // Labels set_labels may neither add nor remove, comma-separated. Persisted as an array in
+  // agent.settings.setLabels.protected; see readProtectedLabels for why the guard exists.
+  protectedLabels: string;
+  setProtectedLabels: (v: string) => void;
   // Operator-authored guidance for update_kanban_task (when/how to edit the card's fields), appended to
   // its model-facing description. Persisted in agent.settings.toolGuidance.update_kanban_task.
   updateKanbanTaskInstructions: string;
@@ -446,8 +459,22 @@ function ConfigurableToolCard({
 
 // Controlled editor for NATIVE / HTTP / MCP / INTEGRATION grants. RAG lives in
 // the Knowledge tab; this component preserves any RAG grant untouched.
+// WHAT A PACK OFFERS *THIS* AGENT. A watcher's turn is assembled with a muted client, and
+// `buildToolpackTools` then drops every tool whose spec declares `deliversToCustomer`. Both places
+// this editor decides a pack's tool set — the auto-grant that runs when an integration is created
+// here, and the list the operator toggles — go through this one function, because filtering only one
+// of them persists a grant nobody saw: inert while the agent is muted, live the moment the mode is
+// flipped back (review round 31).
+export function offeredPackTools<T extends { deliversToCustomer?: boolean }>(
+  tools: T[],
+  observing: boolean | undefined,
+): T[] {
+  return observing ? tools.filter((t) => !t.deliversToCustomer) : tools;
+}
+
 export function ToolGrantsEditor({
   agentId,
+  observing,
   catalog,
   grants,
   onChange,
@@ -463,6 +490,8 @@ export function ToolGrantsEditor({
   setCustomAttributeInstructions,
   labelInstructions,
   setLabelInstructions,
+  protectedLabels,
+  setProtectedLabels,
   updateKanbanTaskInstructions,
   setUpdateKanbanTaskInstructions,
   mcpTools,
@@ -561,7 +590,8 @@ export function ToolGrantsEditor({
         !transferWithSummary)) ||
     (kanbanEnabled && kanbanInstructions.trim() !== "") ||
     (attrEnabled && customAttributeInstructions.trim() !== "") ||
-    (labelEnabled && labelInstructions.trim() !== "") ||
+    (labelEnabled &&
+      (labelInstructions.trim() !== "" || protectedLabels.trim() !== "")) ||
     (updateKanbanEnabled && updateKanbanTaskInstructions.trim() !== "");
 
   // Agents/teams + the accounts the agent serves, for the "pinned" handoff target picker. Scoped to
@@ -597,14 +627,29 @@ export function ToolGrantsEditor({
       }
     })();
   }, [handoffEnabled, handoffData, agentId]);
-  // Pinned is available only when the agent serves exactly one account (0 ⇒ no inbox bound, ≥2 ⇒
-  // ambiguous). `pinnedHint` explains why it is disabled; `pinnedInstanceId` is stored with the target.
+  // PICKING a pinned target needs exactly one account (0 ⇒ no inbox bound, ≥2 ⇒ the listing comes
+  // back empty, because agent and team ids are account-scoped). `pinnedHint` explains why it is
+  // disabled; `pinnedInstanceId` is stored with the target.
   const handoffAccounts = handoffData?.accounts ?? [];
-  const pinnedAvailable = !!handoffData && handoffAccounts.length === 1;
+  const pinnedOfferable = !!handoffData && handoffAccounts.length === 1;
   const pinnedInstanceId =
-    pinnedAvailable && handoffAccounts[0]
+    pinnedOfferable && handoffAccounts[0]
       ? Number(handoffAccounts[0].instanceId)
       : null;
+  // KEEPING one is a different question, and the answer is the account recorded next to the target,
+  // which is what the runtime reads (`prepare.ts`: a pinned target falls back to agent_choice only in
+  // the accounts it does not belong to). Counting accounts is the fallback for a target stored before
+  // that field existed.
+  const storedPinnedAccount = handoffAccounts.find(
+    (a) => Number(a.instanceId) === handoff.targetInstanceId,
+  );
+  const pinnedStoredUsable =
+    handoff.targetInstanceId != null
+      ? !!storedPinnedAccount
+      : handoffAccounts.length === 1;
+  // A pinned target that stands even though this editor cannot offer the list: shown read-only.
+  const pinnedKept =
+    handoff.mode === "pinned" && pinnedStoredUsable && !!storedPinnedAccount;
   const pinnedHint = !handoffData
     ? t("common.loading", "Loading…")
     : handoffAccounts.length === 0
@@ -618,12 +663,23 @@ export function ToolGrantsEditor({
             "This agent serves inboxes in different Chatwoot accounts; use “Let the AI choose”.",
           )
         : undefined;
-  // Auto-switch a stale "pinned" target to "agent_choice" once the fetched data shows the agent is no
-  // longer a single-account agent (its bindings changed in the Channels tab, or its inboxes dropped).
-  // Keeps the SAVED config consistent with what the UI shows and the runtime does; marks the Tools
-  // section unsaved so the operator confirms the change. No loop: after the switch mode !== "pinned".
+  // Auto-switch a "pinned" target to "agent_choice" once the fetched data shows it can no longer be
+  // used ANYWHERE: the account it names is not among the agent's, or it is a legacy target with no
+  // account recorded on an agent that now serves several. Keeps the SAVED config consistent with what
+  // the UI shows and the runtime does; marks the Tools section unsaved so the operator confirms the
+  // change. No loop: after the switch mode !== "pinned".
+  //
+  // A target the runtime WOULD still use is left alone. Switching on account count alone dropped a
+  // valid pinned target — and lit the tab's unsaved dot — the moment a second account's inbox was
+  // bound, with nobody having touched the form. Only judged once accounts came back: zero of them
+  // means no inbox is bound yet, or the read failed, and neither is evidence about the target.
   useEffect(() => {
-    if (handoffData && !pinnedAvailable && handoff.mode === "pinned") {
+    if (
+      handoffData &&
+      handoffAccounts.length > 0 &&
+      !pinnedStoredUsable &&
+      handoff.mode === "pinned"
+    ) {
       setHandoff((h) => ({
         ...h,
         mode: "agent_choice",
@@ -631,7 +687,13 @@ export function ToolGrantsEditor({
         targetInstanceId: null,
       }));
     }
-  }, [handoffData, pinnedAvailable, handoff.mode, setHandoff]);
+  }, [
+    handoffData,
+    handoffAccounts.length,
+    pinnedStoredUsable,
+    handoff.mode,
+    setHandoff,
+  ]);
 
   // Apply the deferred auto-grant for a just-created integration once it appears in the refreshed
   // catalog (so we can enable its full tool set, like the manual toggle does).
@@ -656,10 +718,15 @@ export function ToolGrantsEditor({
       {
         source: "INTEGRATION",
         integrationInstanceId: inst.id,
-        enabledTools: inst.tools.map((tool) => tool.name),
+        // THE SAME PREDICATE THE LIST BELOW USES. Filtering only the rendering would grant a watcher
+        // a delivery tool it never saw — inert while the agent is muted, and live the moment the
+        // mode is flipped back, with nobody having chosen it (review round 31).
+        enabledTools: offeredPackTools(inst.tools, observing).map(
+          (tool) => tool.name,
+        ),
       },
     ]);
-  }, [pendingIntegrationId, catalog, grants, onChange]);
+  }, [pendingIntegrationId, catalog, grants, onChange, observing]);
 
   function toggleNative(name: string) {
     const next = new Set(selectedNative);
@@ -1228,7 +1295,10 @@ export function ToolGrantsEditor({
                 g.source === "INTEGRATION" &&
                 g.integrationInstanceId === inst.id,
             );
-            const allTools = inst.tools.map((tool) => tool.name);
+            // What this agent can actually be offered from the pack. A watcher does not get the
+            // delivery tools, so granting the integration must not enable one either.
+            const offered = offeredPackTools(inst.tools, observing);
+            const allTools = offered.map((tool) => tool.name);
             const collapsed = integrationCollapsed[inst.id] ?? true;
             return (
               <div key={inst.id} className="flex flex-col gap-2">
@@ -1248,7 +1318,7 @@ export function ToolGrantsEditor({
                     }
                   />
                 </EditableCard>
-                {grant && inst.tools.length > 0 && (
+                {grant && offered.length > 0 && (
                   <div className="ml-6 flex flex-col gap-2 border-border border-l pl-3">
                     <button
                       type="button"
@@ -1286,7 +1356,7 @@ export function ToolGrantsEditor({
                       </span>
                     </button>
                     {!collapsed &&
-                      inst.tools.map((tool) => {
+                      offered.map((tool) => {
                         const meta = toolpackToolMeta(tool.name, t);
                         return (
                           <SelectableCard
@@ -1326,68 +1396,72 @@ export function ToolGrantsEditor({
         )}
       </Section>
 
-      <Section
-        id="tools-documents"
-        icon={FileText}
-        title={t("editor.tools.documents", "Documents")}
-        description={t(
-          "editor.tools.documentsDesc",
-          "Templates this agent may issue and attach to a reply. Each one becomes a tool of its own.",
-        )}
-      >
-        {catalog.documentTemplates.length === 0 ? (
-          <p className="text-text-muted text-xs">
-            {t(
-              "editor.tools.noDocuments",
-              "No document templates yet. Create one under Components.",
-            )}
-          </p>
-        ) : (
-          <div className="grid gap-2 sm:grid-cols-2">
-            {catalog.documentTemplates.map((tpl) => (
-              <EditableCard
-                key={tpl.id}
-                editLabel={t(
-                  "editor.tools.documentPreview",
-                  "Preview and edit this template",
-                )}
-                onEdit={() => void openDocument(tpl.id)}
-                busy={openingDocument === tpl.id}
-              >
-                <SelectableCard
-                  selected={nonRag.some(
-                    (g) =>
-                      g.source === "DOCUMENT" &&
-                      g.documentTemplateId === tpl.id,
+      {/* A DOCUMENT IS AN ATTACHMENT TO THE CUSTOMER, so the muted assembly does not build one — the
+          tools this section grants would exist in the console and never in the turn. */}
+      {!observing && (
+        <Section
+          id="tools-documents"
+          icon={FileText}
+          title={t("editor.tools.documents", "Documents")}
+          description={t(
+            "editor.tools.documentsDesc",
+            "Templates this agent may issue and attach to a reply. Each one becomes a tool of its own.",
+          )}
+        >
+          {catalog.documentTemplates.length === 0 ? (
+            <p className="text-text-muted text-xs">
+              {t(
+                "editor.tools.noDocuments",
+                "No document templates yet. Create one under Components.",
+              )}
+            </p>
+          ) : (
+            <div className="grid gap-2 sm:grid-cols-2">
+              {catalog.documentTemplates.map((tpl) => (
+                <EditableCard
+                  key={tpl.id}
+                  editLabel={t(
+                    "editor.tools.documentPreview",
+                    "Preview and edit this template",
                   )}
-                  onToggle={() => toggleDocument(tpl.id)}
-                  icon={FileText}
-                  title={tpl.name}
-                  badge={<Badge variant="secondary">{tpl.toolName}</Badge>}
-                  // AVAILABLE, not merely enabled. Assembly skips a template for two reasons, and an
-                  // operator who cannot see the second one grants a tool, saves, and gets no tool —
-                  // with the row saying nothing about why. The two are separate messages because the
-                  // remedies are: one is a switch on this template, the other is content this build
-                  // cannot read and has to be edited from the client that wrote it.
-                  description={
-                    tpl.available
-                      ? (tpl.description ?? undefined)
-                      : tpl.enabled
-                        ? t(
-                            "editor.tools.documentUnreadable",
-                            "Written by a newer version, so the agent will not see this tool until it is edited from there.",
-                          )
-                        : t(
-                            "editor.tools.documentDisabled",
-                            "Disabled: the agent will not see this tool.",
-                          )
-                  }
-                />
-              </EditableCard>
-            ))}
-          </div>
-        )}
-      </Section>
+                  onEdit={() => void openDocument(tpl.id)}
+                  busy={openingDocument === tpl.id}
+                >
+                  <SelectableCard
+                    selected={nonRag.some(
+                      (g) =>
+                        g.source === "DOCUMENT" &&
+                        g.documentTemplateId === tpl.id,
+                    )}
+                    onToggle={() => toggleDocument(tpl.id)}
+                    icon={FileText}
+                    title={tpl.name}
+                    badge={<Badge variant="secondary">{tpl.toolName}</Badge>}
+                    // AVAILABLE, not merely enabled. Assembly skips a template for two reasons, and an
+                    // operator who cannot see the second one grants a tool, saves, and gets no tool —
+                    // with the row saying nothing about why. The two are separate messages because the
+                    // remedies are: one is a switch on this template, the other is content this build
+                    // cannot read and has to be edited from the client that wrote it.
+                    description={
+                      tpl.available
+                        ? (tpl.description ?? undefined)
+                        : tpl.enabled
+                          ? t(
+                              "editor.tools.documentUnreadable",
+                              "Written by a newer version, so the agent will not see this tool until it is edited from there.",
+                            )
+                          : t(
+                              "editor.tools.documentDisabled",
+                              "Disabled: the agent will not see this tool.",
+                            )
+                    }
+                  />
+                </EditableCard>
+              ))}
+            </div>
+          )}
+        </Section>
+      )}
 
       <CollapsibleSection
         id="tools-native"
@@ -1411,8 +1485,17 @@ export function ToolGrantsEditor({
           </span>
         }
       >
+        {observing && (
+          <p className="text-text-muted text-xs">
+            {t(
+              "editor.tools.observingDelivery",
+              "This agent only observes, so the tools that deliver something to the customer (reactions, images, documents) are not listed: its turn is built with a muted client and would refuse them.",
+            )}
+          </p>
+        )}
         <div className="grid gap-2 sm:grid-cols-2">
           {catalog.native
+            .filter((n) => !(observing && n.deliversToCustomer))
             .filter(
               (n) =>
                 n.name !== HANDOFF_TOOL &&
@@ -1466,15 +1549,28 @@ export function ToolGrantsEditor({
                   "editor.handoffTarget",
                   "Who receives the handoff",
                 )}
-                onChange={(value) =>
+                onChange={(value) => {
+                  // Picking the mode already in force changes nothing, and must WRITE nothing.
+                  // `Dropdown` fires onChange for the current value like any other, and now that
+                  // `pinned` stays reachable while it is the mode in force, that click used to
+                  // rewrite `targetInstanceId` to `pinnedInstanceId` — null wherever the picker
+                  // cannot offer targets — which then failed the check that keeps the target and
+                  // erased the very setting the operator was looking at.
+                  if (value === handoff.mode) return;
                   setHandoff({
                     ...handoff,
                     mode: value,
                     target: value === "pinned" ? handoff.target : "",
+                    // Safe without a fallback to the recorded account precisely BECAUSE of the guard
+                    // above: reaching here with `pinned` means the mode was something else, and the
+                    // item is only selectable then when the agent serves exactly one account — which
+                    // is the case where `pinnedInstanceId` is filled. A `?? handoff.targetInstanceId`
+                    // here reads as prudence and is dead code: no test can tell it apart, and a line
+                    // no test can pin is a line nobody can maintain.
                     targetInstanceId:
                       value === "pinned" ? pinnedInstanceId : null,
-                  })
-                }
+                  });
+                }}
                 items={[
                   {
                     value: "route",
@@ -1489,7 +1585,10 @@ export function ToolGrantsEditor({
                       "editor.handoffPinned",
                       "A specific agent or team",
                     ),
-                    disabled: !pinnedAvailable,
+                    // Never disable the mode the config is ALREADY in and the runtime still honors:
+                    // a disabled current value reads as "this is broken, fix it" about a setting
+                    // that works.
+                    disabled: !pinnedOfferable && !pinnedKept,
                     disabledHint: pinnedHint,
                   },
                   {
@@ -1499,10 +1598,23 @@ export function ToolGrantsEditor({
                 ]}
               />
             </FormField>
-            {handoffData && !pinnedAvailable && (
+            {handoffData && !pinnedOfferable && !pinnedKept && (
               <p className="text-text-muted text-xs">{pinnedHint}</p>
             )}
-            {handoff.mode === "pinned" && pinnedAvailable && (
+            {pinnedKept && !pinnedOfferable && (
+              <p className="text-text-muted text-xs">
+                {t(
+                  "editor.handoffPinnedKept",
+                  "This agent serves inboxes in more than one Chatwoot account, so targets cannot be listed here. The saved target belongs to {{account}} and is used only in that account; elsewhere the AI picks.",
+                  {
+                    account:
+                      storedPinnedAccount?.accountName ??
+                      `#${storedPinnedAccount?.accountId}`,
+                  },
+                )}
+              </p>
+            )}
+            {handoff.mode === "pinned" && pinnedOfferable && (
               <FormField
                 label={t("editor.handoffPick", "Agent or team")}
                 group
@@ -1681,7 +1793,9 @@ export function ToolGrantsEditor({
             icon={nativeToolMeta(LABEL_TOOL, t).icon}
             title={nativeToolMeta(LABEL_TOOL, t).label}
             description={nativeToolMeta(LABEL_TOOL, t).description}
-            configured={labelInstructions.trim() !== ""}
+            configured={
+              labelInstructions.trim() !== "" || protectedLabels.trim() !== ""
+            }
           >
             <FormField
               label={t("editor.labelInstructions", "Usage guidance")}
@@ -1689,7 +1803,7 @@ export function ToolGrantsEditor({
               group
               description={t(
                 "editor.labelInstructionsHint",
-                "Optional. Explains which label to add to the conversation, the contact, or the kanban card, and when. The AI already sees the existing labels; this adds your rules. Appended to the tool description.",
+                "Optional. Which labels the conversation, the contact or the card should carry, and when. The AI sees the ones standing now; write your rules here, including which of them are mutually exclusive.",
               )}
             >
               <Textarea
@@ -1699,7 +1813,26 @@ export function ToolGrantsEditor({
                 maxLength={TOOL_INSTRUCTIONS_MAX}
                 placeholder={t(
                   "editor.labelInstructionsPlaceholder",
-                  'e.g. Add "vip" to the contact for premium customers; tag the conversation "urgent" when the customer is upset.',
+                  'e.g. The conversation carries exactly one of "cancelamento", "compra-de-ingresso" or "outros": when you set one, leave the others out.',
+                )}
+              />
+            </FormField>
+            <FormField
+              label={t("editor.protectedLabels", "Labels off limits")}
+              group
+              description={t(
+                "editor.protectedLabelsHint",
+                "Optional, comma-separated. Labels this agent may neither add nor remove, and never sees. Use it for the ones another system owns — otherwise they last only while the AI remembers to repeat them.",
+              )}
+            >
+              <Input
+                value={protectedLabels}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  setProtectedLabels(e.target.value)
+                }
+                placeholder={t(
+                  "editor.protectedLabelsPlaceholder",
+                  "e.g. agente-off, testando-agente",
                 )}
               />
             </FormField>

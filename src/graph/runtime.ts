@@ -50,6 +50,7 @@ import {
 } from "@/modules/guardrails/gate";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
 import { armCompaction } from "@/modules/memory/compact";
+import { signatureFor } from "@/modules/signature/service";
 import { deliverReply, type ReplyDelivery } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
@@ -63,7 +64,7 @@ import {
   getCheckpointer,
   resolveGraphThreadId,
 } from "./checkpointer";
-import { lastAssistantText } from "./graph";
+import { lastAssistantText, recursionLimitFor } from "./graph";
 import { owesHandbackNote } from "./handback";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { drainPendingIngest } from "./ingest-drain";
@@ -220,6 +221,18 @@ async function notePartialDelivery(params: {
 
 export interface RunLoadedTurnParams {
   loaded: AgentConfig;
+  // WHETHER THE CUSTOMER'S MESSAGE ENDED UP IN THE THREAD, reported by the runtime rather than
+  // inferred from the outcome (issue #576, PR review round 3). `graph.invoke` persists the channel,
+  // so the fact is "the invoke returned" and nothing else — and the outcome word cannot stand in for
+  // it, in either direction: the INPUT guardrail's replacement answers `posted` before the invoke,
+  // and the OUTPUT guardrail's suppression answers `blocked` after it. Called at most once, straight
+  // after the invoke returns; a refusal below suppresses the SEND and rolls back what the MODEL
+  // produced, never the customer's message.
+  //
+  // The caller writes it to the ledger HERE rather than carrying it to the settlement: a TTS or a
+  // send that fails after this point jumps past the settlement, tx2 closes the row all the same, and
+  // the fact would be lost on a row that really does hold the message. Awaited and best-effort.
+  onFoldedIn?: () => void | Promise<void>;
   // What the authorization endpoint said about this contact on the check that let THIS turn happen,
   // or null when the gate is off (or this path has no verdict of its own). Required, not optional:
   // every path that reaches here asks the gate immediately before it, and a path that forgot to
@@ -1099,6 +1112,19 @@ async function runTurnBody(
         );
       }
     }
+    const sig = signatureFor(
+      loaded.signatureConfig,
+      loaded.promptVars,
+      loaded.promptOpts,
+    );
+    const signed = sig
+      ? {
+          text: sig,
+          position: loaded.signatureConfig.position,
+          separator: loaded.signatureConfig.separator,
+          frequency: loaded.signatureConfig.frequency,
+        }
+      : null;
     // And again for the text path, which is reached either directly or after the whole TTS attempt
     // above has failed and fallen through — the longest wait of the two.
     if (await writeCalledOff()) return "stale";
@@ -1115,6 +1141,12 @@ async function runTurnBody(
       // It is what the read-back stops at when the FIRST send is the one that fails, and it costs
       // nothing: the claim already named it (issue #499).
       params.claimReply?.toMessageId ?? null,
+      // THE OPERATOR'S SIGNATURE, resolved here and attached inside `deliverReply` — after the cut,
+      // because both separators are what the splitter cuts on. This is the reply and the handoff's
+      // closing line, the two texts this funnel delivers, so both carry it and carry it identically.
+      // The audio branch above returned before this line: a spoken "Alex, Minha Empresa" is noise, and
+      // the voice note's `transcribedText` is the words that were actually said.
+      signed,
     );
     logger.info(
       "chatwoot agent replied: conv=%s thread=%s len=%d balloons=%d partial=%s",
@@ -1609,6 +1641,45 @@ async function runTurnBody(
           ).values as { messages?: BaseMessage[] } | undefined
         )?.messages ?? [],
       );
+    // THIS INVOKE'S OWN MESSAGE, NAMED (PR review, round 6). The error path below asks whether the
+    // customer's words reached the channel, and a COUNT cannot answer that: two turns can overlap on
+    // one graph thread (the thread is the contact-inbox's, shared by every conversation on it), so a
+    // channel that grew may have grown by somebody else's message while this invoke died before
+    // writing its own. Read that way, the words are recorded as remembered and nothing ever folds
+    // them in.
+    //
+    // An explicit id is what the reducer keys on anyway — `refused-turn.ts` already identifies what
+    // a turn produced the same way — so naming ours costs nothing and makes the question exact.
+    //
+    // It also keeps the read below BEHIND its guard (PR review, round 8): an id needs no
+    // before-picture, so the ordinary turn pays no extra round trip and no extra way to fail.
+    //
+    // NO TEST FAILS WITHOUT THIS, and that is stated rather than hidden. Every failure reachable
+    // from outside either happens before the invoke (so the arm below never runs) or after LangGraph
+    // has written the input (so a count and an id agree); reaching the difference means simulating
+    // the checkpointer's own write ordering, which would be a test about LangGraph rather than about
+    // this. Adopted on the argument: matching the id is strictly narrower than counting, and the
+    // reading it removes is one that costs the customer's words in silence.
+    const inputMessageId = crypto.randomUUID();
+    // WHETHER THE CUSTOMER'S MESSAGE ENDED UP IN THE THREAD, reported the moment it becomes true and
+    // never later (issue #576). Awaited, because the caller writes it to the ledger there and a
+    // throw further down this function must not be able to lose it — the same rule `settleDelivery`
+    // follows in ../modules/chatwoot/webhook.ts, and for the same reason.
+    let reportedFoldedIn = false;
+    const reportFoldedIn = async (): Promise<void> => {
+      if (reportedFoldedIn) return;
+      reportedFoldedIn = true;
+      try {
+        await params.onFoldedIn?.();
+      } catch (e) {
+        // Best-effort: a report that fails leaves the null the reader falls back on, and must not
+        // turn a turn that worked into a retried one.
+        logger.warn(
+          { err: e, conversationId: String(conversationId) },
+          "turn: could not report that the message was folded in",
+        );
+      }
+    };
     const result = await withFlowStage(
       flow,
       "generate",
@@ -1635,20 +1706,56 @@ async function runTurnBody(
               // Stamped with the conversation it belongs to: that stamp, not the divider, is what the
               // compaction cut reads to find where this attendance starts.
               new HumanMessage({
+                id: inputMessageId,
                 content: text,
                 additional_kwargs: conversationStamp(conversationId),
               }),
             ],
           },
           {
+            // Same reason as everywhere else this graph is invoked: LangGraph counts SUPER-STEPS and
+            // its default 25 runs out at about twelve tool rounds, so a budget the operator is
+            // allowed to set (1-50) throws `GraphRecursionError` instead of ending at the budget.
+            recursionLimit: recursionLimitFor(loaded.maxToolCalls),
             configurable: { thread_id: graphThreadId },
             callbacks: [...callbacks, status, toolLogger],
           },
         ),
     ).catch(async (e) => {
+      // A GRAPH THAT RAN SUPERSTEPS AND THEN THREW STILL LEFT THE MESSAGE BEHIND (PR review, round
+      // 5). LangGraph checkpoints as it goes, so a tool that ran before a later model call failed
+      // leaves the customer's `HumanMessage` in the channel while control leaves through here — and
+      // a late transcription then read "no row can say" and folded the same message in again.
+      //
+      // Asked of the CHANNEL, and about THIS invoke's own message rather than about the channel
+      // having grown: an invoke that died before writing anything must stay uncovered, since being
+      // wrong that way costs a duplicate line while being wrong the other way costs the customer's
+      // words. A read that itself fails leaves the row unstated, which is the same safe side.
+      try {
+        const after = (
+          (
+            await buildThreadStateGraph(
+              params.deps?.checkpointer ?? (await getCheckpointer()),
+            ).getState({ configurable: { thread_id: graphThreadId } })
+          ).values as { messages?: BaseMessage[] } | undefined
+        )?.messages;
+        if (after?.some((m) => m.id === inputMessageId)) await reportFoldedIn();
+      } catch (readErr) {
+        logger.warn(
+          { err: readErr, conversationId: String(conversationId) },
+          "turn: could not read the channel after a failed invoke; leaving coverage unstated",
+        );
+      }
       await deliverHandoffPromise();
       throw e;
     });
+    // THE CUSTOMER'S MESSAGE IS IN THE THREAD FROM THIS LINE ON (issue #576), which is the fact
+    // continuous ingestion needs and the one the outcome word cannot carry — the input guardrail's
+    // replacement answers `posted` above this point, and the output guardrail's suppression answers
+    // `blocked` below it. Reported here and only here: an invoke that threw goes out through the
+    // catch above without reaching this, and every refusal below rolls back what the MODEL produced,
+    // never what the customer said.
+    await reportFoldedIn();
     // EVERY REFUSAL FROM HERE DOWN GOES OUT THROUGH THIS, and the fence in
     // tests/graph/refused-turn-callsites.test.ts is what keeps that true.
     //
@@ -2183,6 +2290,8 @@ async function runTurnBody(
 }
 
 export interface RunAgentTurnParams {
+  // See `RunLoadedTurnParams.onFoldedIn`; forwarded verbatim.
+  onFoldedIn?: () => void | Promise<void>;
   tenantId: bigint;
   instanceId: bigint;
   agentBotId: number | null;
@@ -2324,6 +2433,7 @@ export async function runAgentTurn(
       : undefined;
 
   const outcome = await runLoadedTurn({
+    ...(params.onFoldedIn ? { onFoldedIn: params.onFoldedIn } : {}),
     // The direct path answers exactly one message, so the receipt set is that message.
     readMessageIds: typeof n.message?.id === "number" ? [n.message.id] : [],
     // Nothing QUEUED this turn — it is the delivery itself, arriving from the webhook — so there is

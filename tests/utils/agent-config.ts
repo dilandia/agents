@@ -5,6 +5,7 @@ import { HANDOFF_DEFAULTS } from "@/modules/handoff/settings";
 import { SEND_IMAGE_DEFAULTS } from "@/modules/images/settings";
 import { KANBAN_DEFAULTS } from "@/modules/kanban/settings";
 import { SERVICE_WINDOW_DEFAULTS } from "@/modules/service-window/service";
+import { SIGNATURE_DEFAULTS } from "@/modules/signature/service";
 import { SPLIT_DEFAULTS } from "@/modules/split/service";
 import { TTS_DEFAULTS } from "@/modules/tts/settings";
 
@@ -70,12 +71,16 @@ export function makeConfig(
     modelFallbackCredentialBaseUrl: null,
     contactVoiceReply: null,
     splitConfig: SPLIT_DEFAULTS,
+    signatureConfig: SIGNATURE_DEFAULTS,
+    promptVars: {},
+    promptOpts: {},
     serviceWindowConfig: SERVICE_WINDOW_DEFAULTS,
     contactAuthConfig: CONTACT_AUTH_DEFAULTS,
     handoffConfig: HANDOFF_DEFAULTS,
     sendImageConfig: SEND_IMAGE_DEFAULTS,
     kanbanConfig: KANBAN_DEFAULTS,
     toolGuidance: {},
+    protectedLabels: [],
     toolPreconditions: {},
     httpToolContext: {},
     contactName: null,
