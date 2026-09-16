@@ -30,9 +30,7 @@ import { expectWaiverLedger } from "@/tests/utils/ledger";
 async function sourceFiles(dir: string): Promise<string[]> {
   const out: string[] = [];
   for (const e of await readdir(dir, { withFileTypes: true })) {
-    // NOTE: normalized to forward slashes so the `/locales/` filter here and the
-    // path-literal exemptions downstream hold on Windows, where join() answers backslashes.
-    const p = join(dir, e.name).replaceAll("\\", "/");
+    const p = join(dir, e.name);
     if (e.isDirectory()) out.push(...(await sourceFiles(p)));
     else if (/\.tsx?$/.test(e.name) && !p.includes("/locales/")) out.push(p);
   }

@@ -2405,13 +2405,13 @@
       "desc": "Send a Drive file to the customer as an attachment.",
       "label": "Send file"
     },
-    "email_send": {
-      "desc": "Send an email to the customer (confirmation, reminder, follow-up). The sender address comes from the integration settings.",
-      "label": "Send email"
-    },
-    "email_status": {
+    "resend_email_status": {
       "desc": "Check whether an email sent with Send email was delivered or bounced.",
       "label": "Email status"
+    },
+    "resend_send_email": {
+      "desc": "Send an email to the customer (confirmation, reminder, follow-up). The sender address comes from the integration settings.",
+      "label": "Send email"
     }
   },
   "tools": {

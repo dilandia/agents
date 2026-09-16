@@ -2461,13 +2461,13 @@
       "desc": "Envia um arquivo do Drive ao cliente como anexo.",
       "label": "Enviar arquivo"
     },
-    "email_send": {
-      "desc": "Envia um e-mail para o cliente (confirmação, lembrete, follow-up). O remetente vem das configurações da integração.",
-      "label": "Enviar e-mail"
-    },
-    "email_status": {
+    "resend_email_status": {
       "desc": "Verifica se um e-mail enviado com Enviar e-mail foi entregue ou devolveu.",
       "label": "Status do e-mail"
+    },
+    "resend_send_email": {
+      "desc": "Envia um e-mail para o cliente (confirmação, lembrete, follow-up). O remetente vem das configurações da integração.",
+      "label": "Enviar e-mail"
     }
   },
   "tools": {
