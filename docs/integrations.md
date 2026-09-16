@@ -85,7 +85,7 @@ One clinic calendar serves MANY WhatsApp contacts, so every event the agent crea
 
 **Deploy gotcha:** `registerToolpack` runs at **import time**, so a hot-reload may keep an old toolpack build in memory. A stale process (pre-isolation code still running) is what masked the isolation in an early live test — **restart the process on deploy**, do not rely on hot-reload for toolpack changes (see `docs/deploy.md`).
 
-## Resend toolpack — who the agent may write to (`src/modules/integrations/toolpacks/resend.ts`)
+## Resend toolpack: who the agent may write to (`src/modules/integrations/toolpacks/resend.ts`)
 
 The pack sends transactional email (`resend_send_email`) and reads a delivery status back
 (`resend_email_status`). It is the first tool here where the model picks an external **destination**:
@@ -98,7 +98,7 @@ halves of the identity are both bound outside the model.
   `ToolpackCtx.resolveContactEmail`, keyed by `contactDbId`) or an address the operator listed in
   `config.allowedRecipients`. An entry is a whole address or a domain written `@example.com`; the
   `@` is required, since a bare `example.com` also matches `notexample.com`. With neither, the send
-  refuses — "no contact in scope" is the playground and a nudge off a conversation, and reading it
+  refuses, because "no contact in scope" is the playground and a nudge off a conversation, and reading it
   as "any address" turns a test turn into an open relay.
 - **`resend_send_email` declares `deliversToCustomer`**, so the observer's muted turn is never
   offered it. Its delivery does not pass the Chatwoot transport where a muted turn's refusal sits.
@@ -109,7 +109,17 @@ halves of the identity are both bound outside the model.
   the body back, and a capped read leaves a JSON prefix that does not parse. A truncated or
   unparseable answer is reported as a failure, never projected as `{}`.
 
-The credential reaches only the `Authorization` header — never the URL, the body, the model-visible
+- **The key's scope depends on which tools are granted, and the credential test cannot warn about
+  it.** Measured against the live API: a key with Resend's *Sending access* sends fine and answers
+  `401` to `GET /emails/{id}`. *Sending access* is therefore the right scope while only
+  `resend_send_email` is granted, and the wrong one the moment `resend_email_status` is, which needs
+  *Full access*. The save-time probe passes the sending-only key **on purpose** (`secret-types.ts`
+  reads `restricted_api_key` as "valid key, restricted scope", because it still sends), so this is
+  the one misconfiguration an operator reaches with a green credential. The status tool's refusal
+  names it; `HTTP 401` alone sends them looking at the id. An unusable key is a different answer,
+  `400` with "API key is invalid", and the probe rejects that at save time.
+
+The credential reaches only the `Authorization` header, never the URL, the body, the model-visible
 return or the log.
 
 ## Positioning: an external CRM is a bridge, never a second funnel

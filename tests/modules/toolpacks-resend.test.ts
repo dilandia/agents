@@ -260,6 +260,31 @@ describe.skipIf(!dbUp)("resend toolpack — resend_email_status", () => {
     const out = String(await tool?.invoke({ emailId: "email_zz" }));
     expect(out).toContain("HTTP 404");
   });
+
+  // Measured against the live API: a sending-only key sends fine and answers 401 to
+  // `GET /emails/{id}`, and vault/secret-types.ts passes that same key at save time on purpose
+  // (`restricted_api_key` means the key is valid). So this is the one misconfiguration the
+  // credential test cannot warn about, and HTTP 401 alone sends the operator looking at the id.
+  test("a 401 names the key scope, and that the credential test passes anyway", async () => {
+    const { impl } = stubFetch(401, { name: "restricted_api_key" });
+    const tool = statusTool(baseCtx({ fetchImpl: impl }));
+    const out = String(await tool?.invoke({ emailId: "email_1" }));
+    expect(out).toContain("sending access only");
+    expect(out).toContain("credential test passes");
+  });
+
+  // An unreachable key answers 400 ("API key is invalid"), not 401, and the save-time probe
+  // rejects it before any tool runs — so 400 keeps the generic wording rather than guessing.
+  test("a 400 is not read as a scope problem", async () => {
+    const { impl } = stubFetch(400, {
+      name: "validation_error",
+      message: "API key is invalid",
+    });
+    const tool = statusTool(baseCtx({ fetchImpl: impl }));
+    const out = String(await tool?.invoke({ emailId: "email_1" }));
+    expect(out).toContain("HTTP 400");
+    expect(out).not.toContain("full-access");
+  });
 });
 
 // Hardening, from the review of PR #570.

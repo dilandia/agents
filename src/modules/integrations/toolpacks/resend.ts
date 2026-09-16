@@ -39,7 +39,7 @@ const TIMEOUT_MS = 12_000;
 
 // `GET /emails/{id}` echoes back the html the send accepted, so the read cap has to clear the
 // send's own 20k ceiling; at 2k the JSON never parsed and the projection answered `{}`. Bounds the
-// READ only — the projection still drops the body.
+// READ only: the projection still drops the body.
 const MAX_RESPONSE_CHARS = 64_000;
 
 function sysCtx(tenantId: bigint): TenantContext {
@@ -53,7 +53,7 @@ function resolveFrom(config: Record<string, unknown>): string | null {
   return from.length > 0 ? from : null;
 }
 
-// Who may be written to: the contact in scope, or an operator allowlist. Never the model — a
+// Who may be written to: the contact in scope, or an operator allowlist. Never the model, since a
 // prompt reaching `to` would address any mailbox in the tenant's verified name. Absent both, the
 // send refuses, because "no contact" (playground, nudge off a conversation) is not "any address".
 function normalizeEmail(value: unknown): string | null {
@@ -84,7 +84,7 @@ function resolveReplyTo(config: Record<string, unknown>): string | null {
 interface ResendResponse {
   status: number;
   json: unknown;
-  // Answer exceeded the cap, so what we hold is a prefix — and a prefix of JSON is not JSON.
+  // Answer exceeded the cap, so what we hold is a prefix, and a prefix of JSON is not JSON.
   truncated: boolean;
 }
 
@@ -330,6 +330,13 @@ function buildStatusTool(
       if (res.status < 200 || res.status >= 300) {
         if (res.status === 404)
           return "The email provider returned HTTP 404 (email not found). Use the emailId returned by resend_send_email.";
+        // NOTE: measured. A sending-only key sends fine and answers 401 HERE, and the credential
+        // test passes it on purpose (vault/secret-types.ts treats `restricted_api_key` as a valid
+        // key), so the operator arrives with a green credential and an unreadable status forever.
+        if (res.status === 401)
+          return toolFailure(
+            "The email provider refused to read the email (HTTP 401). A Resend key with sending access only can send but not read: reading delivery status needs a full-access key, even though the credential test passes.",
+          );
         return toolFailure(`The email provider returned HTTP ${res.status}.`);
       }
       // Without this the projection hands the model `{}`: no answer and no error.
